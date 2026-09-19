@@ -76,6 +76,33 @@
         }
       }
     },
+    "publish": {
+      "description": "",
+      "versions": {
+        "0.1.0": {
+          "min_recall": "0.6.0",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "079a9264341ba267616c253b152b60e14f1e667467bdf3b43ab82fe3d8dd3616",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-publish-v0.1.0/recall-publish-v0.1.0-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "c8b849bd19a3ba5f2b17bea8c44d4d561dfbbe3d93d365968273f6f01e3526b9",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-publish-v0.1.0/recall-publish-v0.1.0-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "cdf97e6fb4f864d32d235141a0ffe3b868e4838577cabcbbb57c88b5fcddf446",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-publish-v0.1.0/recall-publish-v0.1.0-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "a5764ecfa8984ee9422f0a4dcff7cb68a918c3b9b29f83f6a10f23a6c2ac25e6",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-publish-v0.1.0/recall-publish-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
+        }
+      }
+    },
     "r2": {
       "description": "Cloudflare R2 transport for Recall remote synchronization",
       "versions": {
