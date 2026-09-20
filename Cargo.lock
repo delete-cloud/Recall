@@ -3560,7 +3560,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "recall"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3930,7 +3930,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rx"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "crossterm",

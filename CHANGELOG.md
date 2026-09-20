@@ -1,6 +1,33 @@
 # Changelog
 
 
+## [0.6.1](https://github.com/samzong/Recall/compare/v0.6.0...v0.6.1) (2026-09-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **rx:** stop redirecting harness homes in hosted mode ([#257](https://github.com/samzong/Recall/issues/257))
+
+
+### Features
+
+* **adapters:** add MiniMax Code session adapter ([#263](https://github.com/samzong/Recall/issues/263))
+* **publish:** add the session publishing extension ([#264](https://github.com/samzong/Recall/issues/264))
+
+
+### Fixes
+
+* **rx:** drop --legacy-peer-deps from dsh install ([#258](https://github.com/samzong/Recall/issues/258))
+* **rx:** isolate dsh launch overlay per provider ([#259](https://github.com/samzong/Recall/issues/259))
+* **rx:** cascade-clean rx-owned harness residue on logout ([#262](https://github.com/samzong/Recall/issues/262))
+
+
+### Refactors
+
+* **rx:** consolidate shared logic and split modules ([#260](https://github.com/samzong/Recall/issues/260))
+* **core:** consolidate parsers and state ownership ([#261](https://github.com/samzong/Recall/issues/261))
+
+
 ## [0.6.0](https://github.com/samzong/Recall/compare/v0.5.9...v0.6.0) (2026-09-07)
 
 
