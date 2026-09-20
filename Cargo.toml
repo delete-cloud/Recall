@@ -15,6 +15,9 @@ resolver = "2"
 [workspace.package]
 version = "0.6.0"
 
+[workspace.metadata.release]
+pre-release-commit-message = "chore(release): bump to v{{version}}"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
