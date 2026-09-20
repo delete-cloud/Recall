@@ -16,6 +16,7 @@ fn state(id: &str, name: &str, configured: bool, default: bool) -> ProviderState
             default_model: None,
             claude_default_model: None,
         },
+        orphaned: false,
         configured,
         stored_key: configured,
         environment_active: false,
@@ -97,10 +98,10 @@ fn provider_selection_matches_launch_credentials_and_overrides() {
 }
 
 #[test]
-fn picker_pins_openrouter_and_tokener_then_configured_then_alpha() {
+fn picker_pins_openrouter_then_configured_then_alpha() {
     let mut states = vec![
         state("zenmux", "Zenmux", true, false),
-        state("tokener", "Tokener", false, false),
+        state("acme", "Acme", false, false),
         state("abacus", "Abacus", false, false),
         state("openrouter", "OpenRouter", false, false),
         state("deepseek", "DeepSeek", true, false),
@@ -112,7 +113,7 @@ fn picker_pins_openrouter_and_tokener_then_configured_then_alpha() {
         .into_iter()
         .map(|index| app.providers[index].provider.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, ["OpenRouter", "Tokener", "DeepSeek", "Zenmux", "Abacus"]);
+    assert_eq!(names, ["OpenRouter", "DeepSeek", "Zenmux", "Abacus", "Acme"]);
 }
 
 #[test]
@@ -128,10 +129,8 @@ fn picker_searches_hidden_provider_id() {
 
 #[test]
 fn logout_picker_only_contains_configured_providers() {
-    let providers = vec![
-        state("openrouter", "OpenRouter", true, true),
-        state("tokener", "Tokener", false, false),
-    ];
+    let providers =
+        vec![state("openrouter", "OpenRouter", true, true), state("acme", "Acme", false, false)];
     let app = App::new(Action::Logout, &providers);
     assert_eq!(app.filtered_providers(), vec![0]);
 }
@@ -140,7 +139,7 @@ fn logout_picker_only_contains_configured_providers() {
 fn use_picker_selects_default_without_authentication_step() {
     let providers = vec![
         state("openrouter", "OpenRouter", true, false),
-        state("tokener", "Tokener", true, true),
+        state("acme", "Acme", true, true),
         state("unused", "Unused", false, false),
     ];
     let mut app = App::new(Action::Use, &providers);
@@ -170,10 +169,8 @@ fn picker_ignores_enter_without_a_matching_provider() {
 
 #[test]
 fn direct_login_starts_at_the_api_key_step() {
-    let providers = vec![
-        state("openrouter", "OpenRouter", false, false),
-        state("tokener-dev", "Tokener Dev", false, false),
-    ];
+    let providers =
+        vec![state("openrouter", "OpenRouter", false, false), state("acme", "Acme", false, false)];
     let mut app = App::login_for_provider(&providers, 1);
 
     assert_eq!(app.selected, Some(1));
@@ -220,8 +217,25 @@ fn api_key_is_masked_in_the_rendered_terminal() {
 #[test]
 fn list_uses_one_mutually_exclusive_status_marker() {
     let default = state("openrouter", "OpenRouter", true, true);
-    let configured = state("tokener", "Tokener", true, false);
+    let configured = state("acme", "Acme", true, false);
     let output = render_list(&[&default, &configured]);
     assert!(output.contains("* OpenRouter"));
-    assert!(output.contains("• Tokener"));
+    assert!(output.contains("• Acme"));
+}
+
+#[test]
+fn list_keeps_a_stored_key_visible_after_its_provider_disappears() {
+    let configured = state("openrouter", "OpenRouter", true, true);
+    let unconfigured = state("acme", "Acme", false, false);
+    let mut orphan = state("retired", "retired", true, false);
+    orphan.provider = crate::provider::orphan("retired");
+    orphan.orphaned = true;
+
+    let output = render_list(&[&configured, &unconfigured, &orphan]);
+
+    assert!(output.contains("retired"), "{output}");
+    assert!(!output.contains("Acme"), "{output}");
+    assert!(!orphan.selectable(Action::Use));
+    assert!(!orphan.selectable(Action::Login));
+    assert!(orphan.selectable(Action::Logout));
 }
