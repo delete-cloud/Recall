@@ -305,7 +305,7 @@ fn load_message_nodes(conn: &Connection, session_id: &str) -> anyhow::Result<Vec
         "SELECT node_id, parent_node_id, chat_message, created_at,
                 COALESCE(
                     CASE WHEN json_valid(chat_message)
-                        THEN NULLIF(json_extract(chat_message, '$.message_id'), '')
+                        THEN NULLIF(CAST(json_extract(chat_message, '$.message_id') AS TEXT), '')
                     END,
                     'node:' || node_id
                 )
@@ -377,6 +377,8 @@ fn scan_session(
     }
     let parents: HashMap<i64, Option<i64>> =
         nodes.iter().map(|node| (node.node_id, node.parent_node_id)).collect();
+    // subagent_heads tracks only each chain's current head; trees orphaned by a
+    // context rebuild stay attributed to the main session (no per-node marker).
     let subagent_heads = load_subagent_heads(conn, &session.id);
     let subagent_sets: Vec<(String, HashSet<i64>)> = subagent_heads
         .iter()
