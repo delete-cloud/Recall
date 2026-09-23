@@ -94,12 +94,23 @@ impl SourceAdapter for DevinAdapter {
 }
 
 fn resolve_db_path() -> Option<PathBuf> {
-    resolve_db_path_from(std::env::var("XDG_DATA_HOME").ok(), dirs::home_dir())
+    resolve_db_path_from(
+        std::env::var("XDG_DATA_HOME").ok(),
+        std::env::var("APPDATA").ok(),
+        dirs::home_dir(),
+    )
 }
 
-fn resolve_db_path_from(xdg_data_home: Option<String>, home: Option<PathBuf>) -> Option<PathBuf> {
+fn resolve_db_path_from(
+    xdg_data_home: Option<String>,
+    appdata: Option<String>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
     if let Some(xdg) = xdg_data_home.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(xdg).join("devin").join("cli").join("sessions.db"));
+    }
+    if let Some(appdata) = appdata.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(appdata).join("devin").join("cli").join("sessions.db"));
     }
     Some(home?.join(".local/share/devin/cli/sessions.db"))
 }
@@ -183,6 +194,9 @@ fn scan_devin(
         debug!("Devin sessions.db missing required tables, skipping");
         return Ok(unavailable_scan(context));
     }
+    // Snapshot so the live-set inventory and the parsed rows cannot disagree.
+    let snapshot = conn.unchecked_transaction()?;
+    let conn = &*snapshot;
 
     let incremental = if force { None } else { context };
     let since_ts = if force { None } else { since_ts };
@@ -196,14 +210,14 @@ fn scan_devin(
     let mut stats = crate::adapters::SyncScanStats::default();
     let mut sessions = Vec::new();
 
-    let (live, inventory_issues) = match load_live_ids(&conn, db_path) {
+    let (live, inventory_issues) = match load_live_ids(conn, db_path) {
         Ok(result) => result,
         Err(err) => {
             warn!("failed to inventory Devin sessions at {}: {err}", db_path.display());
             return Ok(unavailable_scan(context));
         }
     };
-    let rows = match load_session_rows(&conn, target_session) {
+    let rows = match load_session_rows(conn, target_session) {
         Ok(rows) => rows,
         Err(err) => {
             warn!("failed to read Devin sessions from {}: {err}", db_path.display());
@@ -244,7 +258,7 @@ fn scan_devin(
             stats.skipped_sessions += 1;
             continue;
         }
-        match scan_session(&conn, &row, db_path, target, started_at, updated_at, include_events) {
+        match scan_session(conn, &row, db_path, target, started_at, updated_at, include_events) {
             Ok(parsed) if !parsed.is_empty() => {
                 stats.parsed += 1;
                 sessions.extend(parsed);
@@ -273,6 +287,10 @@ fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<
                     s.last_activity_at,
                     COALESCE(
                         (SELECT MAX(m.created_at) FROM message_nodes m WHERE m.session_id = s.id),
+                        s.last_activity_at
+                    ),
+                    COALESCE(
+                        (SELECT MAX(sh.updated_at) FROM subagent_heads sh WHERE sh.session_id = s.id),
                         s.last_activity_at
                     )
                 )
@@ -378,7 +396,8 @@ fn scan_session(
     let parents: HashMap<i64, Option<i64>> =
         nodes.iter().map(|node| (node.node_id, node.parent_node_id)).collect();
     // subagent_heads tracks only each chain's current head; trees orphaned by a
-    // context rebuild stay attributed to the main session (no per-node marker).
+    // context rebuild keep their message_ids, so exclude those ids from the
+    // main session even when their nodes no longer sit on a live chain.
     let subagent_heads = load_subagent_heads(conn, &session.id);
     let subagent_sets: Vec<(String, HashSet<i64>)> = subagent_heads
         .iter()
@@ -386,11 +405,21 @@ fn scan_session(
         .collect();
     let subagent_node_ids: HashSet<i64> =
         subagent_sets.iter().flat_map(|(_, set)| set.iter().copied()).collect();
+    let subagent_dedupe_keys: HashSet<&str> = nodes
+        .iter()
+        .filter(|node| subagent_node_ids.contains(&node.node_id))
+        .map(|node| node.dedupe_key.as_str())
+        .collect();
 
     let mut sessions = Vec::new();
     if target.is_none_or(|target| target == session.id) {
-        let main_nodes: Vec<&MessageNode> =
-            nodes.iter().filter(|node| !subagent_node_ids.contains(&node.node_id)).collect();
+        let main_nodes: Vec<&MessageNode> = nodes
+            .iter()
+            .filter(|node| {
+                !subagent_node_ids.contains(&node.node_id)
+                    && !subagent_dedupe_keys.contains(node.dedupe_key.as_str())
+            })
+            .collect();
         if let Some(raw) = build_session(
             session,
             session.id.clone(),
@@ -412,6 +441,8 @@ fn scan_session(
             nodes.iter().filter(|node| set.contains(&node.node_id)).collect();
         let sub_started_at =
             sub_nodes.first().map(|node| seconds_to_ms(node.created_at)).unwrap_or(started_at);
+        let sub_updated_at =
+            sub_nodes.iter().map(|node| seconds_to_ms(node.created_at)).max().unwrap_or(updated_at);
         if let Some(mut raw) = build_session(
             session,
             source_id,
@@ -421,6 +452,8 @@ fn scan_session(
             &sub_nodes,
             include_events,
         ) {
+            raw.duration_minutes =
+                u32::try_from((sub_updated_at - sub_started_at).max(0) / 60_000).ok();
             raw.custom_title = None;
             raw.thread_role = Some(ThreadRole::Subagent);
             raw.parent_links = vec![ParentLink {
@@ -668,11 +701,12 @@ fn usage_event(
         USAGE_PARSER_VERSION,
     );
     event.message_seq = message_seq;
-    event.model = session
-        .model
-        .as_deref()
+    event.model = message
+        .pointer("/metadata/generation_model")
+        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
+        .or_else(|| session.model.as_deref().map(str::trim).filter(|m| !m.is_empty()))
         .unwrap_or("unknown")
         .to_string();
     event.provider = session
@@ -823,14 +857,21 @@ mod tests {
     }
 
     #[test]
-    fn db_path_prefers_xdg_then_home() {
+    fn db_path_prefers_xdg_then_appdata_then_home() {
         let home = tempfile::tempdir().unwrap();
-        let resolved = resolve_db_path_from(None, Some(home.path().to_path_buf())).unwrap();
+        let resolved = resolve_db_path_from(None, None, Some(home.path().to_path_buf())).unwrap();
         assert_eq!(resolved, home.path().join(".local/share/devin/cli/sessions.db"));
-        let resolved =
-            resolve_db_path_from(Some("/tmp/xdg".to_string()), Some(PathBuf::from("/unused")))
-                .unwrap();
+        let resolved = resolve_db_path_from(
+            Some("/tmp/xdg".to_string()),
+            Some("C:\\AppData".to_string()),
+            Some(PathBuf::from("/unused")),
+        )
+        .unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/xdg/devin/cli/sessions.db"));
+        let resolved =
+            resolve_db_path_from(None, Some("/appdata".to_string()), Some(PathBuf::from("/h")))
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/appdata/devin/cli/sessions.db"));
     }
 
     #[test]
@@ -849,7 +890,10 @@ mod tests {
             "message_id": "a1",
             "role": "assistant",
             "content": "done",
-            "metadata": {"metrics": {"input_tokens": 10, "output_tokens": 5}},
+            "metadata": {
+                "generation_model": "swe-2-high",
+                "metrics": {"input_tokens": 10, "output_tokens": 5},
+            },
         });
         let internal = serde_json::json!({
             "message_id": "i1",
@@ -890,7 +934,8 @@ mod tests {
         assert_eq!(raw.usage_events.len(), 1);
         assert_eq!(raw.usage_events[0].input_tokens, 10);
         assert_eq!(raw.usage_events[0].output_tokens, 5);
-        assert_eq!(raw.usage_events[0].model, "swe-2-max");
+        // Per-turn generation_model wins over the session row's model.
+        assert_eq!(raw.usage_events[0].model, "swe-2-high");
         assert_eq!(raw.usage_events[0].provider, "windsurf");
         assert!(matches!(
             result.reconcile,
@@ -994,9 +1039,26 @@ mod tests {
             &user_message("su1", "explore the code"),
             1788279331,
         );
+        // Orphaned tree copy from a context rebuild: same message_id, off-chain.
+        insert_node(
+            &conn,
+            "ses-1",
+            20,
+            None,
+            &serde_json::json!({"message_id": "ss1", "role": "system", "content": "subagent prompt"}),
+            1788279400,
+        );
+        insert_node(
+            &conn,
+            "ses-1",
+            21,
+            Some(20),
+            &user_message("su1", "explore the code"),
+            1788279401,
+        );
         conn.execute(
             "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
-             VALUES ('ses-1', 'explore-1', 6, 1788279331)",
+             VALUES ('ses-1', 'explore-1', 6, 1788279600)",
             [],
         )
         .unwrap();
@@ -1007,6 +1069,8 @@ mod tests {
         let main = result.scan.sessions.iter().find(|s| s.source_id == "ses-1").unwrap();
         assert_eq!(main.messages.len(), 1);
         assert_eq!(main.messages[0].content, "run the subagent");
+        // subagent_heads.updated_at bumps session freshness beyond last_activity_at.
+        assert_eq!(main.updated_at, Some(1_788_279_600_000));
         let sub = result.scan.sessions.iter().find(|s| s.source_id == "ses-1:explore-1").unwrap();
         assert_eq!(sub.thread_role, Some(ThreadRole::Subagent));
         assert_eq!(sub.parent_links[0].source_id, "ses-1");
