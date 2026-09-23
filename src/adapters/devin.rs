@@ -97,14 +97,14 @@ fn resolve_db_path() -> Option<PathBuf> {
     resolve_db_path_from(
         std::env::var("XDG_DATA_HOME").ok(),
         std::env::var("APPDATA").ok(),
-        dirs::data_dir(),
+        dirs::home_dir(),
     )
 }
 
 fn resolve_db_path_from(
     xdg_data_home: Option<String>,
     appdata: Option<String>,
-    data_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(xdg) = xdg_data_home.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(xdg).join("devin").join("cli").join("sessions.db"));
@@ -112,8 +112,8 @@ fn resolve_db_path_from(
     if let Some(appdata) = appdata.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(appdata).join("devin").join("cli").join("sessions.db"));
     }
-    // ~/.local/share on Linux, ~/Library/Application Support on macOS.
-    Some(data_dir?.join("devin").join("cli").join("sessions.db"))
+    // Devin keeps the XDG-style path on macOS too: ~/.local/share/devin/cli.
+    Some(home?.join(".local/share/devin/cli/sessions.db"))
 }
 
 fn has_table(conn: &Connection, name: &str) -> bool {
@@ -238,22 +238,33 @@ fn scan_devin(
             stats.filtered_sessions += 1;
             continue;
         }
+        // Skip only when the parent and every live subagent child are already
+        // indexed at current parser versions — a missing/stale child must not
+        // be hidden by a current parent row.
+        let mut family_ids = vec![row.id.clone()];
+        family_ids.extend(
+            load_subagent_heads(conn, &row.id)
+                .into_iter()
+                .map(|(agent_id, _)| format!("{}:{agent_id}", row.id)),
+        );
         if existing.is_some_and(|existing| {
-            existing.get(&row.id).is_some_and(|old| {
-                old.updated_at == Some(updated_at)
-                    && crate::adapters::sync_state::session_state_is_current(
-                        USAGE_PARSER_VERSION,
-                        EVENT_PARSER_VERSION,
-                        usage_state.and_then(|state| state.get(&row.id).copied()),
-                        event_state.and_then(|state| state.get(&row.id).copied()),
-                        Some(updated_at),
-                        include_events,
-                    )
-                    && crate::adapters::sync_state::parser_state_is_current(
-                        METADATA_PARSER_VERSION,
-                        metadata_state.and_then(|state| state.get(&row.id).copied()),
-                        Some(updated_at),
-                    )
+            family_ids.iter().all(|id| {
+                existing.get(id).is_some_and(|old| {
+                    old.updated_at == Some(updated_at)
+                        && crate::adapters::sync_state::session_state_is_current(
+                            USAGE_PARSER_VERSION,
+                            EVENT_PARSER_VERSION,
+                            usage_state.and_then(|state| state.get(id).copied()),
+                            event_state.and_then(|state| state.get(id).copied()),
+                            Some(updated_at),
+                            include_events,
+                        )
+                        && crate::adapters::sync_state::parser_state_is_current(
+                            METADATA_PARSER_VERSION,
+                            metadata_state.and_then(|state| state.get(id).copied()),
+                            Some(updated_at),
+                        )
+                })
             })
         }) {
             stats.skipped_sessions += 1;
@@ -861,9 +872,9 @@ mod tests {
     }
 
     #[test]
-    fn db_path_prefers_xdg_then_appdata_then_data_dir() {
-        let resolved = resolve_db_path_from(None, None, Some(PathBuf::from("/data"))).unwrap();
-        assert_eq!(resolved, PathBuf::from("/data/devin/cli/sessions.db"));
+    fn db_path_prefers_xdg_then_appdata_then_home() {
+        let resolved = resolve_db_path_from(None, None, Some(PathBuf::from("/home/u"))).unwrap();
+        assert_eq!(resolved, PathBuf::from("/home/u/.local/share/devin/cli/sessions.db"));
         let resolved = resolve_db_path_from(
             Some("/tmp/xdg".to_string()),
             Some("C:\\AppData".to_string()),
@@ -872,7 +883,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/xdg/devin/cli/sessions.db"));
         let resolved =
-            resolve_db_path_from(None, Some("/appdata".to_string()), Some(PathBuf::from("/data")))
+            resolve_db_path_from(None, Some("/appdata".to_string()), Some(PathBuf::from("/h")))
                 .unwrap();
         assert_eq!(resolved, PathBuf::from("/appdata/devin/cli/sessions.db"));
     }
@@ -1118,6 +1129,55 @@ mod tests {
             let ids: Vec<_> = result.scan.sessions.iter().map(|s| s.source_id.as_str()).collect();
             assert_eq!(ids, expected, "target {target}");
         }
+    }
+
+    #[test]
+    fn current_parent_does_not_hide_missing_subagent() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("sessions.db");
+        let conn = setup_devin_db(root.path());
+        insert_session(&conn, "ses-1", 0);
+        insert_node(&conn, "ses-1", 0, None, &user_message("u1", "main"), 1788279318);
+        insert_node(&conn, "ses-1", 5, None, &user_message("su1", "sub task"), 1788279331);
+        conn.execute(
+            "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
+             VALUES ('ses-1', 'explore-1', 5, 1788279331)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Only the parent was indexed (e.g. after a targeted refresh); the
+        // child is absent, so the family must re-emit despite current parent.
+        let store = setup_store();
+        store.insert_session(&make_session("ses-1", Some(1_788_279_401_000), 1)).unwrap();
+        seed_empty_usage_state(
+            &store,
+            "devin",
+            "ses-1",
+            USAGE_PARSER_VERSION,
+            Some(1_788_279_401_000),
+        );
+        seed_empty_event_state(
+            &store,
+            "devin",
+            "ses-1",
+            EVENT_PARSER_VERSION,
+            Some(1_788_279_401_000),
+        );
+        seed_empty_metadata_state(&store, "devin", "ses-1", METADATA_PARSER_VERSION);
+
+        let result = scan_devin(
+            Some(&db_path),
+            Some(&AdapterSyncContext::from_store_for_test(&store, "devin").unwrap()),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let ids: Vec<_> = result.scan.sessions.iter().map(|s| s.source_id.as_str()).collect();
+        assert_eq!(ids, ["ses-1", "ses-1:explore-1"]);
+        assert_eq!(result.scan.stats.skipped_sessions, 0);
     }
 
     #[test]
