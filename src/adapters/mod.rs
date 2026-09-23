@@ -8,6 +8,7 @@ pub(crate) mod copilot_chat;
 pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod deepseek_harness;
+pub(crate) mod devin;
 pub(crate) mod droid;
 pub(crate) mod events;
 pub(crate) mod file_scan;
@@ -422,6 +423,7 @@ pub(crate) fn all_adapters() -> Vec<Box<dyn SourceAdapter>> {
         Box::new(droid::DroidAdapter),
         Box::new(amp::AmpAdapter),
         Box::new(openhands::OpenHandsAdapter),
+        Box::new(devin::DevinAdapter),
     ]
 }
 
@@ -466,6 +468,7 @@ pub(crate) fn source_supports_event_backfill(source_id: &str) -> bool {
             | "gemini-cli"
             | "pi"
             | "omp"
+            | "devin"
     )
 }
 
