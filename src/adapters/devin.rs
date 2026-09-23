@@ -97,14 +97,14 @@ fn resolve_db_path() -> Option<PathBuf> {
     resolve_db_path_from(
         std::env::var("XDG_DATA_HOME").ok(),
         std::env::var("APPDATA").ok(),
-        dirs::home_dir(),
+        dirs::data_dir(),
     )
 }
 
 fn resolve_db_path_from(
     xdg_data_home: Option<String>,
     appdata: Option<String>,
-    home: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(xdg) = xdg_data_home.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(xdg).join("devin").join("cli").join("sessions.db"));
@@ -112,7 +112,8 @@ fn resolve_db_path_from(
     if let Some(appdata) = appdata.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(appdata).join("devin").join("cli").join("sessions.db"));
     }
-    Some(home?.join(".local/share/devin/cli/sessions.db"))
+    // ~/.local/share on Linux, ~/Library/Application Support on macOS.
+    Some(data_dir?.join("devin").join("cli").join("sessions.db"))
 }
 
 fn has_table(conn: &Connection, name: &str) -> bool {
@@ -280,7 +281,14 @@ fn scan_devin(
 }
 
 fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<Vec<SessionRow>> {
-    let mut stmt = conn.prepare(
+    // subagent_heads only exists after the V17 migration; keep it optional.
+    let head_freshness = if has_table(conn, "subagent_heads") {
+        ", COALESCE((SELECT MAX(sh.updated_at) FROM subagent_heads sh
+                    WHERE sh.session_id = s.id), s.last_activity_at)"
+    } else {
+        ""
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT s.id, s.working_directory, s.title, s.model, s.backend_type,
                 s.created_at, s.hidden,
                 MAX(
@@ -288,14 +296,10 @@ fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<
                     COALESCE(
                         (SELECT MAX(m.created_at) FROM message_nodes m WHERE m.session_id = s.id),
                         s.last_activity_at
-                    ),
-                    COALESCE(
-                        (SELECT MAX(sh.updated_at) FROM subagent_heads sh WHERE sh.session_id = s.id),
-                        s.last_activity_at
-                    )
+                    ){head_freshness}
                 )
-         FROM sessions s WHERE (?1 IS NULL OR s.id = ?1)",
-    )?;
+         FROM sessions s WHERE (?1 IS NULL OR s.id = ?1)"
+    ))?;
     let rows = stmt.query_map([target], |row| {
         Ok(SessionRow {
             id: row.get(0)?,
@@ -857,10 +861,9 @@ mod tests {
     }
 
     #[test]
-    fn db_path_prefers_xdg_then_appdata_then_home() {
-        let home = tempfile::tempdir().unwrap();
-        let resolved = resolve_db_path_from(None, None, Some(home.path().to_path_buf())).unwrap();
-        assert_eq!(resolved, home.path().join(".local/share/devin/cli/sessions.db"));
+    fn db_path_prefers_xdg_then_appdata_then_data_dir() {
+        let resolved = resolve_db_path_from(None, None, Some(PathBuf::from("/data"))).unwrap();
+        assert_eq!(resolved, PathBuf::from("/data/devin/cli/sessions.db"));
         let resolved = resolve_db_path_from(
             Some("/tmp/xdg".to_string()),
             Some("C:\\AppData".to_string()),
@@ -869,7 +872,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/xdg/devin/cli/sessions.db"));
         let resolved =
-            resolve_db_path_from(None, Some("/appdata".to_string()), Some(PathBuf::from("/h")))
+            resolve_db_path_from(None, Some("/appdata".to_string()), Some(PathBuf::from("/data")))
                 .unwrap();
         assert_eq!(resolved, PathBuf::from("/appdata/devin/cli/sessions.db"));
     }
