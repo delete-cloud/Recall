@@ -9,7 +9,8 @@ use crate::adapters::events::{self, EventContext};
 use crate::adapters::json_util::json_i64;
 use crate::adapters::opencode;
 use crate::adapters::{
-    AdapterSyncContext, RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult,
+    AdapterSyncContext, InventoryIssue, RawMessage, RawSession, ReconcilePlan, ResumeCommand,
+    SourceAdapter, SyncScanOutput, SyncScanResult,
 };
 use crate::types::{
     FileEvidence, FileOperation, ParentLink, ParentRelation, RawSessionEvent, RawUsageEvent, Role,
@@ -38,6 +39,7 @@ struct MessageNode {
     node_id: i64,
     parent_node_id: Option<i64>,
     chat_message: String,
+    dedupe_key: String,
     created_at: i64,
 }
 
@@ -67,24 +69,26 @@ impl SourceAdapter for DevinAdapter {
     }
 
     fn start_command(&self, prompt: String) -> Option<ResumeCommand> {
-        Some(crate::adapters::prompt_start("devin", prompt))
+        Some(ResumeCommand { program: "devin".to_string(), args: vec!["--".to_string(), prompt] })
     }
 
     fn scan(&self) -> anyhow::Result<Vec<RawSession>> {
-        Ok(scan_database(resolve_db_path().as_deref(), None, None, true)?.sessions)
+        Ok(scan_devin(resolve_db_path().as_deref(), None, None, true, false)?.scan.sessions)
     }
 
-    fn scan_for_sync(
+    fn scan_for_sync_output(
         &self,
         context: &AdapterSyncContext,
         since_ts: Option<i64>,
         include_events: bool,
-    ) -> anyhow::Result<Option<SyncScanResult>> {
-        Ok(Some(scan_database(
+        force: bool,
+    ) -> anyhow::Result<Option<SyncScanOutput>> {
+        Ok(Some(scan_devin(
             resolve_db_path().as_deref(),
             Some(context),
             since_ts,
             include_events,
+            force,
         )?))
     }
 }
@@ -100,44 +104,123 @@ fn resolve_db_path_from(xdg_data_home: Option<String>, home: Option<PathBuf>) ->
     Some(home?.join(".local/share/devin/cli/sessions.db"))
 }
 
-fn scan_database(
+fn has_table(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok()
+}
+
+fn unavailable_scan(context: Option<&AdapterSyncContext>) -> SyncScanOutput {
+    let scan = SyncScanResult::default();
+    if context.is_some_and(AdapterSyncContext::has_existing_sessions) {
+        return SyncScanOutput {
+            scan,
+            reconcile: Some(ReconcilePlan::UnavailableInventory(Vec::new())),
+        };
+    }
+    SyncScanOutput { scan, reconcile: None }
+}
+
+fn load_live_ids(
+    conn: &Connection,
+    db_path: &Path,
+) -> anyhow::Result<(HashSet<String>, Vec<InventoryIssue>)> {
+    let mut live = HashSet::new();
+    let mut issues = Vec::new();
+    let mut stmt = conn.prepare("SELECT id FROM sessions WHERE hidden = 0")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        match row {
+            Ok(id) => {
+                live.insert(id);
+            }
+            Err(_) => issues.push(InventoryIssue {
+                path: db_path.to_path_buf(),
+                category: std::io::ErrorKind::InvalidData,
+            }),
+        }
+    }
+    if has_table(conn, "subagent_heads") {
+        let mut stmt = conn.prepare(
+            "SELECT sh.session_id || ':' || sh.agent_id
+             FROM subagent_heads sh
+             JOIN sessions s ON s.id = sh.session_id
+             WHERE s.hidden = 0",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            match row {
+                Ok(id) => {
+                    live.insert(id);
+                }
+                Err(_) => issues.push(InventoryIssue {
+                    path: db_path.to_path_buf(),
+                    category: std::io::ErrorKind::InvalidData,
+                }),
+            }
+        }
+    }
+    Ok((live, issues))
+}
+
+fn scan_devin(
     db_path: Option<&Path>,
     context: Option<&AdapterSyncContext>,
     since_ts: Option<i64>,
     include_events: bool,
-) -> anyhow::Result<SyncScanResult> {
-    let mut result = SyncScanResult::default();
+    force: bool,
+) -> anyhow::Result<SyncScanOutput> {
     let Some(db_path) = db_path else {
-        return Ok(result);
+        return Ok(unavailable_scan(context));
     };
     let Some(conn) = opencode::open_readonly(db_path)? else {
-        return Ok(result);
+        return Ok(unavailable_scan(context));
     };
+    if !has_table(&conn, "sessions") || !has_table(&conn, "message_nodes") {
+        debug!("Devin sessions.db missing required tables, skipping");
+        return Ok(unavailable_scan(context));
+    }
+
+    let incremental = if force { None } else { context };
+    let since_ts = if force { None } else { since_ts };
+    let existing = incremental.map(AdapterSyncContext::session_meta);
+    let usage_state = incremental.map(AdapterSyncContext::usage_state);
+    let event_state = incremental.map(AdapterSyncContext::event_state);
+    let metadata_state = incremental.map(AdapterSyncContext::metadata_state);
     let target = context.and_then(AdapterSyncContext::target_source_id);
     let target_session = target.map(|id| id.split(':').next().unwrap_or(id));
+
+    let mut stats = crate::adapters::SyncScanStats::default();
+    let mut sessions = Vec::new();
+
+    let (live, inventory_issues) = match load_live_ids(&conn, db_path) {
+        Ok(result) => result,
+        Err(err) => {
+            warn!("failed to inventory Devin sessions at {}: {err}", db_path.display());
+            return Ok(unavailable_scan(context));
+        }
+    };
     let rows = match load_session_rows(&conn, target_session) {
         Ok(rows) => rows,
         Err(err) => {
             warn!("failed to read Devin sessions from {}: {err}", db_path.display());
-            return Ok(result);
+            return Ok(unavailable_scan(context));
         }
     };
 
-    let existing = context.map(AdapterSyncContext::session_meta);
-    let usage_state = context.map(AdapterSyncContext::usage_state);
-    let event_state = context.map(AdapterSyncContext::event_state);
-    let metadata_state = context.map(AdapterSyncContext::metadata_state);
-
     for row in rows {
-        result.stats.candidates += 1;
+        stats.candidates += 1;
         if row.hidden != 0 {
-            result.stats.filtered_sessions += 1;
+            stats.filtered_sessions += 1;
             continue;
         }
         let started_at = seconds_to_ms(row.created_at);
         let updated_at = seconds_to_ms(row.last_activity_at);
         if since_ts.is_some_and(|cutoff| updated_at < cutoff) {
-            result.stats.filtered_sessions += 1;
+            stats.filtered_sessions += 1;
             continue;
         }
         if existing.is_some_and(|existing| {
@@ -158,20 +241,28 @@ fn scan_database(
                     )
             })
         }) {
-            result.stats.skipped_sessions += 1;
+            stats.skipped_sessions += 1;
             continue;
         }
         match scan_session(&conn, &row, db_path, target, started_at, updated_at, include_events) {
-            Ok(parsed) => {
-                if !parsed.is_empty() {
-                    result.stats.parsed += 1;
-                }
-                result.sessions.extend(parsed);
+            Ok(parsed) if !parsed.is_empty() => {
+                stats.parsed += 1;
+                sessions.extend(parsed);
             }
+            Ok(_) => stats.filtered_sessions += 1,
             Err(err) => warn!("failed to parse Devin session {}: {err}", row.id),
         }
     }
-    Ok(result)
+
+    let reconcile = if inventory_issues.is_empty() {
+        Some(ReconcilePlan::CompleteLiveSet(live))
+    } else {
+        Some(ReconcilePlan::PartialInventory(inventory_issues))
+    };
+    Ok(SyncScanOutput {
+        scan: SyncScanResult { sessions, stats, observations: Vec::new() },
+        reconcile,
+    })
 }
 
 fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<Vec<SessionRow>> {
@@ -211,7 +302,13 @@ fn load_session_rows(conn: &Connection, target: Option<&str>) -> anyhow::Result<
 
 fn load_message_nodes(conn: &Connection, session_id: &str) -> anyhow::Result<Vec<MessageNode>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id, parent_node_id, chat_message, created_at
+        "SELECT node_id, parent_node_id, chat_message, created_at,
+                COALESCE(
+                    CASE WHEN json_valid(chat_message)
+                        THEN NULLIF(json_extract(chat_message, '$.message_id'), '')
+                    END,
+                    'node:' || node_id
+                )
          FROM message_nodes
          WHERE session_id = ?1
          ORDER BY node_id ASC",
@@ -222,6 +319,7 @@ fn load_message_nodes(conn: &Connection, session_id: &str) -> anyhow::Result<Vec
             parent_node_id: row.get(1)?,
             chat_message: row.get(2)?,
             created_at: row.get(3)?,
+            dedupe_key: row.get(4)?,
         })
     })?;
     let mut nodes = Vec::new();
@@ -350,7 +448,7 @@ fn build_session(
     }
     let mut raw = RawSession::search_only(
         source_id,
-        Some(directory.to_string()),
+        (!directory.is_empty()).then(|| directory.to_string()),
         started_at,
         Some(updated_at),
         None,
@@ -378,25 +476,19 @@ fn parse_nodes(
     include_events: bool,
 ) -> ParsedNodes {
     let mut parsed = ParsedNodes::default();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut call_names: HashMap<String, String> = HashMap::new();
     for node in nodes {
+        if !seen.insert(node.dedupe_key.as_str()) {
+            continue;
+        }
         let message: Value = match serde_json::from_str(&node.chat_message) {
             Ok(message) => message,
             Err(err) => {
-                debug!("skipping malformed Devin message node {}: {err}", node.node_id);
+                warn!("skipping malformed Devin message node {}: {err}", node.node_id);
                 continue;
             }
         };
-        let key = message
-            .get("message_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("node:{}", node.node_id));
-        if !seen.insert(key.clone()) {
-            continue;
-        }
         let timestamp = seconds_to_ms(node.created_at);
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
@@ -455,7 +547,7 @@ fn parse_nodes(
                     }
                 }
                 if let Some(usage) = usage_event(
-                    &key,
+                    &node.dedupe_key,
                     parsed.usage_events.len() as u32,
                     timestamp,
                     message_seq,
@@ -481,6 +573,13 @@ fn parse_nodes(
                 let summary = (!content.trim().is_empty()).then(|| content.to_string());
                 let mut event = events::tool_result_event(context, name, summary);
                 event.tool_call_id = call_id.map(str::to_string);
+                event.status = message
+                    .get("metadata")
+                    .and_then(|meta| meta.get("extensions"))
+                    .and_then(|ext| ext.get("chisel/tool_result_meta"))
+                    .and_then(|meta| meta.get("success"))
+                    .and_then(Value::as_bool)
+                    .map(|success| if success { "success" } else { "error" }.to_string());
                 parsed.events.push(event);
             }
             _ => {}
@@ -530,7 +629,11 @@ fn parse_tool_call(
             .filter(|command| !command.trim().is_empty())
             .map(str::to_string);
         if let Some(command) = event.target.as_deref() {
-            let cwd = Some(directory).filter(|cwd| Path::new(cwd).is_absolute());
+            let cwd = args
+                .and_then(|args| args.get("workdir").or_else(|| args.get("cwd")))
+                .and_then(Value::as_str)
+                .filter(|path| Path::new(path).is_absolute())
+                .or(Some(directory).filter(|dir| Path::new(dir).is_absolute()));
             let (files, status) = events::shell_file_evidence(command, cwd);
             event.files = files;
             event.command_evidence_status = Some(status);
@@ -688,12 +791,17 @@ mod tests {
         .unwrap();
     }
 
-    fn chat(role: &str, content: &str) -> Value {
+    fn user_message(id: &str, content: &str) -> Value {
         serde_json::json!({
-            "message_id": format!("msg-{role}-{}", content.len()),
-            "role": role,
+            "message_id": id,
+            "role": "user",
             "content": content,
+            "metadata": {"is_user_input": true},
         })
+    }
+
+    fn scan_path(path: &Path) -> SyncScanOutput {
+        scan_devin(Some(path), None, None, true, false).unwrap()
     }
 
     #[test]
@@ -703,6 +811,13 @@ mod tests {
         assert_eq!(command.args, vec!["--resume", "oxidized-sardine"]);
         let sub = DevinAdapter.resume_command("oxidized-sardine:agent-1").unwrap();
         assert_eq!(sub.args, vec!["--resume", "oxidized-sardine"]);
+    }
+
+    #[test]
+    fn start_command_uses_dash_dash_separator() {
+        let command = DevinAdapter.start_command("fix the tests".to_string()).unwrap();
+        assert_eq!(command.program, "devin");
+        assert_eq!(command.args, vec!["--", "fix the tests"]);
     }
 
     #[test]
@@ -727,12 +842,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let conn = setup_devin_db(root.path());
         insert_session(&conn, "ses-1", 0);
-        let user = serde_json::json!({
-            "message_id": "u1",
-            "role": "user",
-            "content": "fix the tests",
-            "metadata": {"is_user_input": true},
-        });
+        let user = user_message("u1", "fix the tests");
         let assistant = serde_json::json!({
             "message_id": "a1",
             "role": "assistant",
@@ -744,26 +854,26 @@ mod tests {
             "role": "user",
             "content": "Conversation to summarize: ...",
         });
-        // First turn tree.
         insert_node(&conn, "ses-1", 0, None, &user, 1788279318);
         insert_node(&conn, "ses-1", 1, Some(0), &assistant, 1788279320);
         insert_node(&conn, "ses-1", 2, Some(1), &internal, 1788279321);
         // Rebuilt tree for the next turn replays the same message ids.
         insert_node(&conn, "ses-1", 10, None, &user, 1788279390);
         insert_node(&conn, "ses-1", 11, Some(10), &assistant, 1788279391);
-        let follow_up = serde_json::json!({
-            "message_id": "u2",
-            "role": "user",
-            "content": "now lint it",
-            "metadata": {"is_user_input": true},
-        });
-        insert_node(&conn, "ses-1", 12, Some(11), &follow_up, 1788279400);
+        insert_node(&conn, "ses-1", 12, Some(11), &user_message("u2", "now lint it"), 1788279400);
+        // A malformed node is skipped, not fatal.
+        conn.execute(
+            "INSERT INTO message_nodes
+             (session_id, node_id, parent_node_id, chat_message, created_at)
+             VALUES ('ses-1', 13, 12, 'not json', 1788279401)",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
-        let result =
-            scan_database(Some(&root.path().join("sessions.db")), None, None, true).unwrap();
-        assert_eq!(result.sessions.len(), 1);
-        let raw = &result.sessions[0];
+        let result = scan_path(&root.path().join("sessions.db"));
+        assert_eq!(result.scan.sessions.len(), 1);
+        let raw = &result.scan.sessions[0];
         assert_eq!(raw.source_id, "ses-1");
         assert_eq!(raw.custom_title.as_deref(), Some("seed title"));
         assert_eq!(raw.directory.as_deref(), Some("/repo"));
@@ -780,6 +890,10 @@ mod tests {
         assert_eq!(raw.usage_events[0].output_tokens, 5);
         assert_eq!(raw.usage_events[0].model, "swe-2-max");
         assert_eq!(raw.usage_events[0].provider, "windsurf");
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ref live)) if live.contains("ses-1")
+        ));
     }
 
     #[test]
@@ -799,7 +913,7 @@ mod tests {
             }, {
                 "id": "call-2",
                 "name": "exec",
-                "arguments": {"command": "git restore -- src/lib.rs"},
+                "arguments": {"command": "git restore -- src/lib.rs", "workdir": "/repo/sub"},
                 "kind": "function"
             }],
         });
@@ -808,14 +922,14 @@ mod tests {
             "role": "tool",
             "content": "applied",
             "tool_call_id": "call-1",
+            "metadata": {"extensions": {"chisel/tool_result_meta": {"success": false}}},
         });
         insert_node(&conn, "ses-1", 0, None, &call, 1788279320);
         insert_node(&conn, "ses-1", 1, Some(0), &result_msg, 1788279325);
         drop(conn);
 
-        let result =
-            scan_database(Some(&root.path().join("sessions.db")), None, None, true).unwrap();
-        let raw = &result.sessions[0];
+        let result = scan_path(&root.path().join("sessions.db"));
+        let raw = &result.scan.sessions[0];
         assert_eq!(raw.events.len(), 3);
         assert_eq!(raw.events[0].kind, "file_write");
         assert_eq!(raw.events[0].target.as_deref(), Some("/repo/a.rs"));
@@ -823,25 +937,37 @@ mod tests {
         assert_eq!(raw.events[1].kind, "command");
         assert_eq!(raw.events[1].target.as_deref(), Some("git restore -- src/lib.rs"));
         assert_eq!(raw.events[1].files[0].path, "src/lib.rs");
+        assert_eq!(raw.events[1].files[0].cwd.as_deref(), Some("/repo/sub"));
         assert_eq!(raw.events[2].kind, "tool_result");
         assert_eq!(raw.events[2].name.as_deref(), Some("edit"));
         assert_eq!(raw.events[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(raw.events[2].status.as_deref(), Some("error"));
     }
 
     #[test]
-    fn hidden_sessions_and_empty_sessions_are_skipped() {
+    fn hidden_and_empty_sessions_are_skipped_and_tombstoned() {
         let root = tempfile::tempdir().unwrap();
         let conn = setup_devin_db(root.path());
         insert_session(&conn, "hidden", 1);
         insert_session(&conn, "empty", 0);
-        insert_node(&conn, "empty", 0, None, &chat("system", "prompt"), 1788279318);
+        insert_node(
+            &conn,
+            "empty",
+            0,
+            None,
+            &serde_json::json!({"message_id": "s1", "role": "system", "content": "prompt"}),
+            1788279318,
+        );
         drop(conn);
 
-        let result =
-            scan_database(Some(&root.path().join("sessions.db")), None, None, true).unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.candidates, 2);
-        assert_eq!(result.stats.filtered_sessions, 1);
+        let result = scan_path(&root.path().join("sessions.db"));
+        assert!(result.scan.sessions.is_empty());
+        assert_eq!(result.scan.stats.candidates, 2);
+        assert_eq!(result.scan.stats.filtered_sessions, 2);
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ref live)) if live.contains("empty") && !live.contains("hidden")
+        ));
     }
 
     #[test]
@@ -849,22 +975,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let conn = setup_devin_db(root.path());
         insert_session(&conn, "ses-1", 0);
-        let user = serde_json::json!({
-            "message_id": "u1",
-            "role": "user",
-            "content": "run the subagent",
-            "metadata": {"is_user_input": true},
-        });
-        let sub_system = chat("system", "subagent prompt");
-        let sub_user = serde_json::json!({
-            "message_id": "su1",
-            "role": "user",
-            "content": "explore the code",
-            "metadata": {"is_user_input": true},
-        });
-        insert_node(&conn, "ses-1", 0, None, &user, 1788279318);
-        insert_node(&conn, "ses-1", 5, None, &sub_system, 1788279330);
-        insert_node(&conn, "ses-1", 6, Some(5), &sub_user, 1788279331);
+        insert_node(&conn, "ses-1", 0, None, &user_message("u1", "run the subagent"), 1788279318);
+        insert_node(
+            &conn,
+            "ses-1",
+            5,
+            None,
+            &serde_json::json!({"message_id": "ss1", "role": "system", "content": "subagent prompt"}),
+            1788279330,
+        );
+        insert_node(
+            &conn,
+            "ses-1",
+            6,
+            Some(5),
+            &user_message("su1", "explore the code"),
+            1788279331,
+        );
         conn.execute(
             "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
              VALUES ('ses-1', 'explore-1', 6, 1788279331)",
@@ -873,17 +1000,55 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let result =
-            scan_database(Some(&root.path().join("sessions.db")), None, None, true).unwrap();
-        assert_eq!(result.sessions.len(), 2);
-        let main = result.sessions.iter().find(|s| s.source_id == "ses-1").unwrap();
+        let result = scan_path(&root.path().join("sessions.db"));
+        assert_eq!(result.scan.sessions.len(), 2);
+        let main = result.scan.sessions.iter().find(|s| s.source_id == "ses-1").unwrap();
         assert_eq!(main.messages.len(), 1);
         assert_eq!(main.messages[0].content, "run the subagent");
-        let sub = result.sessions.iter().find(|s| s.source_id == "ses-1:explore-1").unwrap();
+        let sub = result.scan.sessions.iter().find(|s| s.source_id == "ses-1:explore-1").unwrap();
         assert_eq!(sub.thread_role, Some(ThreadRole::Subagent));
         assert_eq!(sub.parent_links[0].source_id, "ses-1");
         assert_eq!(sub.messages.len(), 1);
         assert_eq!(sub.messages[0].content, "explore the code");
+        assert!(matches!(
+            result.reconcile,
+            Some(ReconcilePlan::CompleteLiveSet(ref live))
+                if live.contains("ses-1") && live.contains("ses-1:explore-1")
+        ));
+    }
+
+    #[test]
+    fn targeted_refresh_reaches_subagent_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = setup_devin_db(root.path());
+        insert_session(&conn, "ses-1", 0);
+        insert_node(&conn, "ses-1", 0, None, &user_message("u1", "main"), 1788279318);
+        insert_node(&conn, "ses-1", 5, None, &user_message("su1", "sub task"), 1788279331);
+        conn.execute(
+            "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
+             VALUES ('ses-1', 'explore-1', 5, 1788279331)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        for (target, expected) in [
+            ("ses-1", vec!["ses-1"]),
+            ("ses-1:explore-1", vec!["ses-1:explore-1"]),
+            ("missing", vec![]),
+        ] {
+            let context = AdapterSyncContext::empty_for_test("devin").restricted_to(target);
+            let result = scan_devin(
+                Some(&root.path().join("sessions.db")),
+                Some(&context),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            let ids: Vec<_> = result.scan.sessions.iter().map(|s| s.source_id.as_str()).collect();
+            assert_eq!(ids, expected, "target {target}");
+        }
     }
 
     #[test]
@@ -892,19 +1057,7 @@ mod tests {
         let db_path = root.path().join("sessions.db");
         let conn = setup_devin_db(root.path());
         insert_session(&conn, "ses-1", 0);
-        insert_node(
-            &conn,
-            "ses-1",
-            0,
-            None,
-            &serde_json::json!({
-                "message_id": "u1",
-                "role": "user",
-                "content": "hello",
-                "metadata": {"is_user_input": true},
-            }),
-            1788279318,
-        );
+        insert_node(&conn, "ses-1", 0, None, &user_message("u1", "hello"), 1788279318);
         drop(conn);
 
         let store = setup_store();
@@ -925,14 +1078,26 @@ mod tests {
         );
         seed_empty_metadata_state(&store, "devin", "ses-1", METADATA_PARSER_VERSION);
 
-        let result = scan_database(
+        let result = scan_devin(
             Some(&db_path),
             Some(&AdapterSyncContext::from_store_for_test(&store, "devin").unwrap()),
             None,
             true,
+            false,
         )
         .unwrap();
-        assert!(result.sessions.is_empty());
-        assert_eq!(result.stats.skipped_sessions, 1);
+        assert!(result.scan.sessions.is_empty());
+        assert_eq!(result.scan.stats.skipped_sessions, 1);
+
+        // Force reprocesses even when the session state is current.
+        let forced = scan_devin(
+            Some(&db_path),
+            Some(&AdapterSyncContext::from_store_for_test(&store, "devin").unwrap()),
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(forced.scan.sessions.len(), 1);
     }
 }
