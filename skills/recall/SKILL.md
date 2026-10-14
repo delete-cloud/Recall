@@ -18,6 +18,14 @@ If neither MCP nor the installed CLI is available, stop and offer `brew install 
 - `all` covers every indexed project.
 - The CLI derives an omitted `--project` from its working directory. Recall MCP treats an omitted `project` as global, so pass the current project unless the user explicitly requests all projects.
 
+## Scheduled Sync
+
+- `recall sync schedule install --interval 30m`
+- `recall sync schedule status`
+- `recall sync schedule uninstall`
+
+Run install or uninstall only when the user explicitly requests a schedule change; run status only when the user asks to inspect it.
+
 ## Find Sessions
 
 For a specific historical question, use MCP `search_messages` with keywords and the current project. Each match includes `session_id`, `seq`, `role`, and an excerpt around the match. Add `session_id` to search within a known session. This is full-text matching, not semantic search; use `search_sessions` for broader session discovery and `list_recent_sessions` when there is no query.

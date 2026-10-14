@@ -597,11 +597,34 @@ pruning sessions whose source transcript disappeared, and backfilling repo
 identity for sessions indexed before it was resolvable. Deleting sessions that
 match `excluded_paths` still runs, restricted to the current scope.
 
+### Scheduled Sync (macOS)
+
+```bash
+recall sync schedule install --interval 30m
+recall sync schedule status
+recall sync schedule uninstall
+```
+
+The interval defaults to 30m; use an integer with `s`, `m`, or `h` units and a
+minimum of 60 seconds. The LaunchAgent label is `io.github.samzong.recall.sync`;
+its plist is `~/Library/LaunchAgents/io.github.samzong.recall.sync.plist` and
+logs are `~/Library/Logs/recall/sync.stdout.log` and
+`~/Library/Logs/recall/sync.stderr.log`.
+
+Install runs the first sync immediately. macOS may prompt for access to multiple
+folders in sequence; click Allow within 60 seconds for each prompt. If the first
+sync fails, rerun `recall sync schedule install` (include `--interval` again to
+retain a custom interval).
+
+Git metadata probes time out after 60 seconds and abort the whole sync. The same
+timeout applies to manual syncs and read commands that infer a project from the
+current directory; read commands can bypass inference with `--project all`.
+Linux and Windows report `not supported yet on <os>`.
+
 ## Backward Compatibility
 
-- Existing commands keep working: `recall search`, `recall export`,
-  `recall import`, `recall usage`, `recall share init`, and the TUI remain
-  unchanged.
+- Existing command names and flags remain available: `recall search`,
+  `recall export`, `recall import`, `recall usage`, `recall share init`, and the TUI.
 - Existing `recall export` remains the bulk export command.
 - Existing TUI shortcuts keep using the same internal session operations.
 - Export record schema is `v7`: event records retain `files` and nullable

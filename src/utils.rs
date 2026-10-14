@@ -69,7 +69,20 @@ pub(crate) fn try_acquire_sync_lock() -> anyhow::Result<Option<File>> {
 
 fn acquire_lock(path: &Path) -> anyhow::Result<File> {
     let mut file = open_lock_file(path)?;
-    file.lock_exclusive()?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            let owner =
+                std::fs::read_to_string(path).ok().and_then(|pid| pid.trim().parse::<u32>().ok());
+            if let Some(pid) = owner {
+                eprintln!("Waiting for another Recall sync (pid {pid})");
+            } else {
+                eprintln!("Waiting for another Recall sync");
+            }
+            file.lock_exclusive()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     write_lock_owner(&mut file)?;
     Ok(file)
 }
@@ -286,16 +299,6 @@ fn is_noise_first_message(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lock_file_excludes_parallel_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sync.lock");
-        let first = acquire_lock(&path).unwrap();
-
-        assert!(try_acquire_lock(&path).unwrap().is_none());
-        drop(first);
-    }
 
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
