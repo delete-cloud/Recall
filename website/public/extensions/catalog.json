@@ -46,6 +46,28 @@
               "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.1/recall-powercontext-v0.1.1-x86_64-unknown-linux-gnu.tar.gz"
             }
           }
+        },
+        "0.1.2": {
+          "min_recall": "0.4.0",
+          "protocol": 2,
+          "targets": {
+            "aarch64-apple-darwin": {
+              "sha256": "2f56dd97ac5d3b7b3419f5ca41096e7af099ca90c2d4fa5f5f2b56806233bf19",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-aarch64-apple-darwin.tar.gz"
+            },
+            "x86_64-apple-darwin": {
+              "sha256": "678c5a90e21b13544b42888ff43f24059cb5c0389125c992b2bd8f160dc28943",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-x86_64-apple-darwin.tar.gz"
+            },
+            "x86_64-pc-windows-msvc": {
+              "sha256": "487b1689939ec1d0554abb04f83cc91a023ea9248346cccf74409f74ce0660c5",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-x86_64-pc-windows-msvc.zip"
+            },
+            "x86_64-unknown-linux-gnu": {
+              "sha256": "894e9f8a449da9b4cabaf85e04880351bc73fecf73fb6068106cf2f7373066e5",
+              "url": "https://github.com/samzong/Recall/releases/download/recall-powercontext-v0.1.2/recall-powercontext-v0.1.2-x86_64-unknown-linux-gnu.tar.gz"
+            }
+          }
         }
       }
     },
