@@ -467,7 +467,7 @@ fn semver_key(version: &str) -> Result<(u64, u64, u64)> {
     Ok((parts[0].parse()?, parts[1].parse()?, parts[2].parse()?))
 }
 
-fn validate_extension_name(name: &str) -> Result<()> {
+pub(crate) fn validate_extension_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('-')
         || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')

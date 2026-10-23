@@ -20,7 +20,7 @@ use transfer::{download_objects, upload_objects};
 pub(crate) enum RemoteCommands {
     #[command(about = "Configure the remote destination, upload scope, and host name")]
     Connect {
-        #[arg(long, help = "Storage provider (r2)")]
+        #[arg(long, help = "Storage provider extension name (default: r2)")]
         provider: Option<String>,
         #[arg(long, help = "Upload scope: a path, owner/repo, remote URL, or all")]
         project: Option<String>,
@@ -85,7 +85,8 @@ fn load_from(path: &Path) -> Result<Option<Settings>> {
         serde_json::from_slice(&bytes).context("invalid remote configuration")?;
     settings.host.validate()?;
     if let Some(connection) = &settings.connection {
-        ensure!(connection.provider == "r2", "unsupported remote provider");
+        crate::extension::validate_extension_name(&connection.provider)
+            .context("unsupported remote provider")?;
         validate_scope(&connection.scope)?;
     }
     Ok(Some(settings))
@@ -261,12 +262,12 @@ fn connect(
     provider_args: &[OsString],
 ) -> Result<()> {
     let provider = provider.unwrap_or_else(|| "r2".into());
-    ensure!(provider == "r2", "only the r2 provider is currently supported");
+    crate::extension::validate_extension_name(&provider).context("unsupported remote provider")?;
     let binary = crate::extension::remote_binary(&provider)?;
     let _lock = crate::utils::acquire_sync_lock()?;
     let existing = load_settings()?;
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    eprintln!("Storage: Cloudflare R2");
+    eprintln!("Storage: {provider}");
     let project = match project {
         Some(project) => project,
         None => {
