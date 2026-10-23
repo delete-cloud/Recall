@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, params_from_iter, types::ValueRef};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::adapters::json_util::rfc3339_ms;
 use crate::adapters::paths;
@@ -14,13 +14,18 @@ use crate::adapters::{
     RawMessage, RawSession, ResumeCommand, SourceAdapter, SyncScanResult, SyncScanStats,
 };
 use crate::types::{
-    FileEvidence, FileEvidenceKind, FileOperation, RawSessionEvent, RawUsageEvent, Role,
+    FileEvidence, FileEvidenceKind, FileOperation, ParentLink, ParentRelation, RawSessionEvent,
+    RawUsageEvent, Role, ThreadRole,
 };
+
+#[path = "opencode_v2.rs"]
+mod v2;
 
 const MAX_SQL_VARS_PER_BATCH: usize = 900;
 pub(crate) const USAGE_PARSER_VERSION: u32 = 2;
 pub(crate) const EVENT_PARSER_VERSION: u32 = 7;
 pub(crate) const METADATA_PARSER_VERSION: u32 = 2;
+const NATIVE_METADATA_PARSER_VERSION: u32 = 3;
 const PARSED_PART_FILTER_SQL: &str = "
     json_valid(m.data)
     AND json_valid(p.data)
@@ -38,11 +43,33 @@ pub(crate) struct ScanOptions {
     pub exclude_hidden_transcript: bool,
     pub exclude_timeline_usage: bool,
     zcode_tools: bool,
+    native_topology: bool,
 }
 
 impl ScanOptions {
-    pub(crate) const ZCODE: Self =
-        Self { exclude_hidden_transcript: true, exclude_timeline_usage: true, zcode_tools: true };
+    pub(crate) const ZCODE: Self = Self {
+        exclude_hidden_transcript: true,
+        exclude_timeline_usage: true,
+        zcode_tools: true,
+        native_topology: false,
+    };
+
+    const OPENCODE_NATIVE: Self = Self {
+        exclude_hidden_transcript: false,
+        exclude_timeline_usage: false,
+        zcode_tools: false,
+        native_topology: true,
+    };
+
+    fn metadata_parser_version(self, native_v2: bool) -> u32 {
+        if self.native_topology && native_v2 {
+            4
+        } else if self.native_topology {
+            NATIVE_METADATA_PARSER_VERSION
+        } else {
+            METADATA_PARSER_VERSION
+        }
+    }
 
     fn transcript_sql(self) -> &'static str {
         if self.exclude_hidden_transcript { HIDDEN_TRANSCRIPT_FILTER_SQL } else { "" }
@@ -61,6 +88,12 @@ struct SessionRow {
     time_created: i64,
     time_updated: Option<i64>,
     title: Option<String>,
+    parent_id: Option<String>,
+    v2: bool,
+    // For a session present in both schemas, the millisecond timestamp of the
+    // last legacy `message` row; V2 rows at or before it are treated as a
+    // lossy copy and skipped. `None` means the session has no legacy history.
+    legacy_tail: Option<i64>,
 }
 
 impl SourceAdapter for OpenCodeAdapter {
@@ -91,7 +124,7 @@ impl SourceAdapter for OpenCodeAdapter {
         let Some(conn) = open_opencode_db()? else {
             return Ok(vec![]);
         };
-        scan(&conn, true)
+        scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE)
     }
 
     fn scan_for_sync(
@@ -104,7 +137,13 @@ impl SourceAdapter for OpenCodeAdapter {
             return Ok(Some(SyncScanResult::default()));
         };
 
-        Ok(Some(scan_for_sync_conn(&conn, context, since_ts, include_events)?))
+        Ok(Some(scan_for_sync_conn_with_options(
+            &conn,
+            context,
+            since_ts,
+            include_events,
+            ScanOptions::OPENCODE_NATIVE,
+        )?))
     }
 }
 
@@ -157,7 +196,7 @@ pub(crate) fn scan_with_options(
     include_events: bool,
     options: ScanOptions,
 ) -> anyhow::Result<Vec<RawSession>> {
-    let (sessions, _) = load_session_rows(conn, None, None)?;
+    let (sessions, _) = load_session_rows(conn, None, None, options)?;
     scan_session_messages(conn, sessions, include_events, options)
 }
 
@@ -165,8 +204,59 @@ fn load_session_rows(
     conn: &Connection,
     since_ts: Option<i64>,
     target: Option<&str>,
+    options: ScanOptions,
 ) -> anyhow::Result<(Vec<SessionRow>, u32)> {
-    let mut stmt = conn.prepare("SELECT id, directory, time_created, time_updated, title FROM session WHERE (?1 IS NULL OR id = ?1)")?;
+    let native_v2 = options.native_topology && has_table(conn, "session_v2")?;
+    let legacy = has_table(conn, "session")?;
+    // Other adapters share this parser but do not share OpenCode's parent semantics.
+    // A missing column is compatible; other schema/query errors still propagate.
+    let has_parent_id = if options.native_topology && legacy {
+        let mut columns = conn.prepare("PRAGMA table_info(session)")?;
+        let names = columns.query_map([], |row| row.get::<_, String>(1))?;
+        names.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|name| name == "parent_id")
+    } else {
+        false
+    };
+    let parent_column = if has_parent_id { "parent_id" } else { "NULL AS parent_id" };
+    let mut selects = Vec::new();
+    if legacy {
+        let exclude_v2 = if native_v2 {
+            "AND NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = session.id)"
+        } else {
+            ""
+        };
+        selects.push(format!(
+            "SELECT id, directory, time_created, time_updated, title,
+            {parent_column}, 0 AS v2, NULL AS legacy_tail
+            FROM session WHERE (?1 IS NULL OR id = ?1) {exclude_v2}"
+        ));
+    }
+    if native_v2 {
+        let legacy_blend = if legacy {
+            "COALESCE((SELECT l.time_updated FROM session l WHERE l.id = s.id), s.time_created)"
+        } else {
+            "s.time_created"
+        };
+        let legacy_tail = if legacy {
+            "(SELECT MAX(lm.time_created) FROM message lm WHERE lm.session_id = s.id)"
+        } else {
+            "NULL"
+        };
+        selects.push(format!(
+            "SELECT s.id, s.directory, s.time_created,
+            MAX(COALESCE(s.time_updated, s.time_created),
+                COALESCE((SELECT MAX(COALESCE(m.time_updated, m.time_created))
+                    FROM session_message m WHERE m.session_id = s.id), s.time_created),
+                {legacy_blend}),
+            s.title, s.parent_id, 1 AS v2,
+            {legacy_tail} AS legacy_tail
+            FROM session_v2 s WHERE (?1 IS NULL OR s.id = ?1)"
+        ));
+    }
+    if selects.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let mut stmt = conn.prepare(&selects.join(" UNION ALL "))?;
     let rows = stmt.query_map([target], map_session_row)?;
     let mut sessions = Vec::new();
     for row in rows {
@@ -184,6 +274,14 @@ fn load_session_rows(
     Ok((sessions, filtered))
 }
 
+fn has_table(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )
+}
+
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         id: row.get(0)?,
@@ -191,6 +289,9 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         time_created: sqlite_millis(row, 2)?.unwrap_or(0),
         time_updated: sqlite_millis(row, 3)?,
         title: row.get(4)?,
+        parent_id: row.get(5)?,
+        v2: row.get(6)?,
+        legacy_tail: sqlite_millis(row, 7)?,
     })
 }
 
@@ -238,7 +339,19 @@ fn scan_session_messages(
         return Ok(vec![]);
     }
 
-    let session_ids: Vec<String> = sessions.iter().map(|session| session.id.clone()).collect();
+    // Legacy loaders run for pure-legacy sessions and for mixed sessions, where
+    // the legacy rows hold history (tokens, patch events) the V2 copy lost.
+    let session_ids: Vec<String> = sessions
+        .iter()
+        .filter(|s| !s.v2 || s.legacy_tail.is_some())
+        .map(|s| s.id.clone())
+        .collect();
+    let v2_ids: Vec<String> = sessions.iter().filter(|s| s.v2).map(|s| s.id.clone()).collect();
+    let v2_tails: HashMap<String, i64> = sessions
+        .iter()
+        .filter(|s| s.v2)
+        .filter_map(|s| s.legacy_tail.map(|tail| (s.id.clone(), tail)))
+        .collect();
     let mut session_messages: HashMap<String, Vec<RawMessage>> = HashMap::new();
     let mut session_usage_events: HashMap<String, Vec<RawUsageEvent>> = HashMap::new();
     let mut session_events: HashMap<String, Vec<RawSessionEvent>> = HashMap::new();
@@ -250,14 +363,35 @@ fn scan_session_messages(
             load_event_chunk(conn, chunk, &mut session_events, options)?;
         }
     }
+    for chunk in v2_ids.chunks(MAX_SQL_VARS_PER_BATCH) {
+        let directories =
+            sessions.iter().filter(|s| s.v2).map(|s| (s.id.clone(), s.directory.clone())).collect();
+        let data = v2::load_chunk(conn, chunk, include_events, &directories, &v2_tails)?;
+        for (sid, items) in data.messages {
+            session_messages.entry(sid).or_default().extend(items);
+        }
+        for (sid, items) in data.usage {
+            session_usage_events.entry(sid).or_default().extend(items);
+        }
+        for (sid, items) in data.events {
+            session_events.entry(sid).or_default().extend(items);
+        }
+    }
 
     let mut raw_sessions = Vec::new();
     for session in sessions {
         let messages = session_messages.remove(&session.id).unwrap_or_default();
         let usage_events = session_usage_events.remove(&session.id).unwrap_or_default();
         let mut events = session_events.remove(&session.id).unwrap_or_default();
+        // A mixed session merges legacy events and V2 tail events, each numbered
+        // from zero in its own schema; renumber so session_events stays unique.
+        for (seq, event) in events.iter_mut().enumerate() {
+            event.event_seq = seq as u32;
+        }
         for file in events.iter_mut().flat_map(|event| &mut event.files) {
-            if !options.zcode_tools
+            // Legacy file rows for a mixed session also need the directory fallback.
+            if (session.legacy_tail.is_some() || !session.v2)
+                && !options.zcode_tools
                 && file.kind != FileEvidenceKind::Command
                 && file.cwd.is_none()
                 && !session.directory.trim().is_empty()
@@ -265,10 +399,32 @@ fn scan_session_messages(
                 file.cwd = Some(session.directory.clone());
             }
         }
-        if messages.is_empty() && usage_events.is_empty() && events.is_empty() {
+        if (session.legacy_tail.is_some() || !session.v2)
+            && messages.is_empty()
+            && usage_events.is_empty()
+            && events.is_empty()
+        {
             continue;
         }
 
+        let parent = session.parent_id.as_deref().map(str::trim).filter(|id| !id.is_empty());
+        let parent = parent.filter(|id| {
+            if *id == session.id {
+                warn!(session_id = %session.id, "ignoring self-referential OpenCode parent_id");
+                false
+            } else {
+                true
+            }
+        });
+        let parent_links: Vec<_> = parent
+            .into_iter()
+            .map(|id| ParentLink {
+                relation: ParentRelation::Spawn,
+                source: "opencode".to_string(),
+                source_id: id.to_string(),
+            })
+            .collect();
+        let thread_role = (!parent_links.is_empty()).then_some(ThreadRole::Subagent);
         let mut raw = RawSession::search_only(
             session.id,
             Some(session.directory),
@@ -281,7 +437,9 @@ fn scan_session_messages(
         raw.source_file_path = conn.path().filter(|path| !path.is_empty()).map(str::to_string);
         raw.custom_title =
             session.title.map(|title| title.trim().to_string()).filter(|title| !title.is_empty());
-        raw.metadata_parser_version = Some(METADATA_PARSER_VERSION);
+        raw.thread_role = thread_role;
+        raw.parent_links = parent_links;
+        raw.metadata_parser_version = Some(options.metadata_parser_version(session.v2));
         raw.refresh_session_on_metadata_backfill = true;
         raw_sessions.push(if include_events {
             raw.with_events(events, EVENT_PARSER_VERSION)
@@ -782,16 +940,29 @@ pub(crate) fn scan_for_sync_conn_with_options(
     options: ScanOptions,
 ) -> anyhow::Result<SyncScanResult> {
     let (sessions, filtered_sessions) =
-        load_session_rows(conn, since_ts, context.target_source_id())?;
+        load_session_rows(conn, since_ts, context.target_source_id(), options)?;
     let existing = context.session_meta();
     let usage_state = context.usage_state();
     let event_state = context.event_state();
     let metadata_state = context.metadata_state();
-    let current_counts = load_message_counts(
-        conn,
-        &sessions.iter().map(|session| session.id.clone()).collect::<Vec<_>>(),
-        options,
-    )?;
+    // Mixed sessions count both their legacy history and their V2 tail.
+    let legacy_ids: Vec<String> = sessions
+        .iter()
+        .filter(|s| !s.v2 || s.legacy_tail.is_some())
+        .map(|s| s.id.clone())
+        .collect();
+    let mut current_counts = load_message_counts(conn, &legacy_ids, options)?;
+    let v2_ids = sessions.iter().filter(|s| s.v2).map(|s| s.id.clone()).collect::<Vec<_>>();
+    let v2_tails: HashMap<String, i64> = sessions
+        .iter()
+        .filter(|s| s.v2)
+        .filter_map(|s| s.legacy_tail.map(|tail| (s.id.clone(), tail)))
+        .collect();
+    for chunk in v2_ids.chunks(MAX_SQL_VARS_PER_BATCH) {
+        for (sid, count) in v2::message_counts(conn, chunk, &v2_tails)? {
+            *current_counts.entry(sid).or_insert(0) += count;
+        }
+    }
 
     let mut stats = SyncScanStats {
         candidates: sessions.len() as u32,
@@ -814,7 +985,7 @@ pub(crate) fn scan_for_sync_conn_with_options(
                     include_events,
                 )
                 && crate::adapters::sync_state::parser_state_is_current(
-                    METADATA_PARSER_VERSION,
+                    options.metadata_parser_version(session.v2),
                     metadata_state.get(&session.id).copied(),
                     session.time_updated,
                 )
@@ -923,12 +1094,656 @@ mod tests {
         seed_empty_usage_state(store, "opencode", source_id, USAGE_PARSER_VERSION, updated_at);
     }
 
+    fn add_v2_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+             parent_id TEXT, time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT,
+             type TEXT, seq INTEGER, data TEXT, time_created INTEGER, time_updated INTEGER);",
+        )
+        .unwrap();
+    }
+
+    fn insert_v2_user(conn: &Connection, id: &str, parent: Option<&str>, text: &str) {
+        insert_v2_user_at(conn, id, parent, text, 100);
+    }
+
+    // V2 `session_message.time_created` mirrors the legacy `message.time_created`
+    // for migrated copies and advances for messages written after the upgrade.
+    fn insert_v2_user_at(
+        conn: &Connection,
+        id: &str,
+        parent: Option<&str>,
+        text: &str,
+        time_created: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO session_v2 VALUES (?1, '/tmp/project', 'V2', ?2, 100, 200)",
+            rusqlite::params![id, parent],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, 'user', 1, ?3, ?4, ?4)",
+            rusqlite::params![
+                format!("msg_{id}"),
+                id,
+                serde_json::json!({"text":text}).to_string(),
+                time_created
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v2_only_schema_reads_body_and_parent_in_both_scans() {
+        let conn = Connection::open_in_memory().unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "root", None, "root body");
+        insert_v2_user(&conn, "child", Some("root"), "child body");
+        let full = scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap();
+        let incremental = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::empty_for_test("opencode"),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap()
+        .sessions;
+        for sessions in [full, incremental] {
+            assert_eq!(sessions.len(), 2);
+            let child = sessions.iter().find(|s| s.source_id == "child").unwrap();
+            assert_eq!(child.messages[0].content, "child body");
+            assert_eq!(child.thread_role, Some(ThreadRole::Subagent));
+            assert_eq!(child.parent_links[0].source_id, "root");
+        }
+    }
+
+    #[test]
+    // A mixed session keeps its legacy history and appends only the V2 rows
+    // written after the last legacy message; legacy-only sessions are untouched.
+    fn v2_mixed_schema_merges_legacy_history_and_v2_tail() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "same", 200, 100, "stale legacy");
+        insert_session_with_message(&conn, "legacy-only", 200, 100, "legacy body");
+        add_v2_tables(&conn);
+        // The migrated V2 copy duplicates the legacy message at the same
+        // timestamp; only the later row written after the upgrade joins it.
+        insert_v2_user_at(&conn, "same", None, "copied legacy", 110);
+        conn.execute(
+            "INSERT INTO session_message VALUES ('msg_same_new','same','user',2,
+             '{\"text\":\"new body\"}',300,300)",
+            [],
+        )
+        .unwrap();
+        let rows = scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap();
+        assert_eq!(rows.len(), 2);
+        let same = rows.iter().find(|s| s.source_id == "same").unwrap();
+        assert_eq!(
+            same.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["stale legacy", "new body"]
+        );
+        assert_eq!(
+            rows.iter().find(|s| s.source_id == "legacy-only").unwrap().messages[0].content,
+            "legacy body"
+        );
+        let shared = scan_with_options(&conn, true, ScanOptions::default()).unwrap();
+        assert_eq!(
+            shared.iter().find(|s| s.source_id == "same").unwrap().messages[0].content,
+            "stale legacy"
+        );
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_assistant_text_usage_order_and_repeat_counts_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "s", None, "question");
+        let data = serde_json::json!({"model":{"id":"model","providerID":"provider"},
+            "tokens":{"input":11,"output":7,"reasoning":3,"cache":{"read":2,"write":1}},
+            "content":[{"type":"reasoning","text":"private"},
+                       {"type":"text","text":"first"},{"type":"text","text":"second"}]});
+        conn.execute(
+            "INSERT INTO session_message VALUES ('assistant', 's', 'assistant', 2, ?1, 90, 250)",
+            [data.to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO session_message VALUES ('synthetic','s','synthetic',3,'{\"text\":\"machine\"}',110,110)", []).unwrap();
+        let raw =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        assert_eq!(
+            raw.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["question", "first", "second"]
+        );
+        assert_eq!(raw.updated_at, Some(250));
+        assert_eq!(raw.usage_events.len(), 1);
+        assert_eq!(raw.usage_events[0].input_tokens, 11);
+        assert_eq!(raw.usage_events[0].provider, "provider");
+        let store =
+            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", raw)
+                .unwrap();
+        let repeat = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert!(repeat.sessions.is_empty());
+        assert_eq!(repeat.stats.skipped_sessions, 1);
+    }
+
+    #[test]
+    // An empty V2 copy still leaves the legacy history readable; malformed V2
+    // rows in other sessions are skipped without losing valid ones.
+    fn v2_empty_copy_keeps_legacy_and_malformed_messages_are_skipped() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "empty", 200, 100, "stale history");
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "empty", None, "copy");
+        conn.execute("DELETE FROM session_message", []).unwrap();
+        insert_v2_user(&conn, "valid", None, "keep me");
+        conn.execute(
+            "INSERT INTO session_message VALUES ('bad','valid','user',2,'{broken',100,100)",
+            [],
+        )
+        .unwrap();
+        let rows = scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap();
+        assert_eq!(rows.len(), 2);
+        let empty = rows.iter().find(|r| r.source_id == "empty").unwrap();
+        assert_eq!(empty.messages.len(), 1);
+        assert_eq!(empty.messages[0].content, "stale history");
+        assert_eq!(
+            rows.iter().find(|r| r.source_id == "valid").unwrap().messages[0].content,
+            "keep me"
+        );
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    // Regression for the upgraded-database case: the migrated V2 copy drops
+    // tokens and patch parts, so the legacy rows must stay readable and only
+    // the rows written after the last legacy message come from V2.
+    fn v2_mixed_session_preserves_legacy_tokens_and_patch_events() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('s', 'Mixed', '/tmp/project', 100, 500)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('s', ?1, 110)",
+            [r#"{"role":"assistant","modelID":"m","providerID":"p",
+                "tokens":{"input":100,"output":20},"path":{"cwd":"/tmp/project"}}"#],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        for part in [
+            serde_json::json!({"type":"text","text":"legacy answer"}),
+            serde_json::json!({"type":"patch","hash":"h1","files":["src/a.rs"]}),
+        ] {
+            conn.execute(
+                "INSERT INTO part (id, message_id, data) VALUES (NULL, ?1, ?2)",
+                rusqlite::params![message_id, part.to_string()],
+            )
+            .unwrap();
+        }
+
+        add_v2_tables(&conn);
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('s', '/tmp/project', 'Mixed', NULL, 100, 500)",
+            [],
+        )
+        .unwrap();
+        // Lossy migrated copy: same message, no tokens, no patch part.
+        conn.execute(
+            "INSERT INTO session_message VALUES ('copy','s','assistant',1,?1,110,110)",
+            [serde_json::json!({"content":[{"type":"text","text":"legacy answer"}]}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('tail','s','user',2,?1,400,400)",
+            [serde_json::json!({"text":"after upgrade"}).to_string()],
+        )
+        .unwrap();
+
+        let raw =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        assert_eq!(
+            raw.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["legacy answer", "after upgrade"]
+        );
+        assert_eq!(raw.usage_events.len(), 1);
+        assert_eq!(raw.usage_events[0].input_tokens, 100);
+        let files: Vec<_> = raw.events.iter().flat_map(|event| event.files.iter()).collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/a.rs");
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    // Legacy and V2 events are each numbered from zero in their own schema; a
+    // merged mixed session must renumber before persisting or the
+    // UNIQUE(session_id, event_seq) constraint aborts the transaction.
+    fn v2_mixed_session_events_persist_with_unique_event_seq() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute(
+            "INSERT INTO session (id, title, directory, time_created, time_updated)
+             VALUES ('s', 'Mixed', '/tmp/project', 100, 500)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (session_id, data, time_created)
+             VALUES ('s', ?1, 110)",
+            [r#"{"role":"assistant","path":{"cwd":"/tmp/project"}}"#],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data) VALUES (NULL, ?1, ?2)",
+            rusqlite::params![
+                message_id,
+                serde_json::json!({"type":"patch","hash":"h1","files":["src/a.rs"]}).to_string()
+            ],
+        )
+        .unwrap();
+
+        add_v2_tables(&conn);
+        conn.execute(
+            "INSERT INTO session_v2 VALUES ('s', '/tmp/project', 'Mixed', NULL, 100, 500)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('tail','s','assistant',2,?1,400,400)",
+            [serde_json::json!({"content":[{"type":"tool","name":"bash","id":"c1","state":{"status":"completed","input":{"command":"ls"}}}]})
+                .to_string()],
+        )
+        .unwrap();
+
+        let raw =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        // The merged list must carry strictly increasing event_seq values.
+        let seqs: Vec<u32> = raw.events.iter().map(|event| event.event_seq).collect();
+        assert_eq!(seqs, (0..seqs.len() as u32).collect::<Vec<_>>());
+        let store =
+            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", raw)
+                .unwrap();
+        let count: i64 =
+            store.conn.query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0)).unwrap();
+        assert!(count >= 2, "expected both legacy and V2 events persisted");
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_metadata_three_backfill_and_same_count_edit_refresh() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "s", 200, 100, "old body");
+        let mut old =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        old.metadata_parser_version = Some(3);
+        let store =
+            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", old)
+                .unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user_at(&conn, "s", None, "new body", 300);
+        let mut result = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        let raw = result.sessions.pop().unwrap();
+        assert_eq!(raw.metadata_parser_version, Some(4));
+        assert_eq!(
+            raw.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["old body", "new body"]
+        );
+        let store =
+            crate::sync::persist_raw_session_for_conformance(store, "opencode", raw).unwrap();
+        conn.execute("UPDATE session_message SET data='{\"text\":\"edited body\"}',time_updated=400 WHERE id='msg_s'", []).unwrap();
+        let changed = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            Some(350),
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert_eq!(changed.sessions.len(), 1);
+        assert_eq!(changed.sessions[0].messages[1].content, "edited body");
+        assert_eq!(changed.sessions[0].updated_at, Some(400));
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_tools_preserve_calls_and_results_separately_from_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "s", None, "question");
+        let data = serde_json::json!({"content":[{"type":"tool","id":"call1","name":"read",
+            "state":{"status":"completed","input":{"filePath":"src/main.rs"},
+                "content":[{"type":"text","text":"tool output"}]}},
+            {"type":"text","text":"answer"}]});
+        conn.execute(
+            "INSERT INTO session_message VALUES ('assistant','s','assistant',2,?1,150,150)",
+            [data.to_string()],
+        )
+        .unwrap();
+        let raw =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        assert_eq!(
+            raw.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["question", "answer"]
+        );
+        assert_eq!(raw.events.len(), 2);
+        assert_eq!(raw.events[0].name.as_deref(), Some("read"));
+        assert_eq!(raw.events[0].tool_call_id.as_deref(), Some("call1"));
+        assert_eq!(raw.events[1].tool_call_id.as_deref(), Some("call1"));
+        assert_eq!(raw.events[1].status.as_deref(), Some("success"));
+        assert_eq!(raw.events[1].summary.as_deref(), Some("tool output"));
+        assert_eq!(raw.events[0].files[0].path, "src/main.rs");
+        let without =
+            scan_with_options(&conn, false, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        assert!(without.events.is_empty());
+        assert_eq!(without.messages.len(), 2);
+    }
+
+    #[test]
+    // With an empty V2 copy the legacy history stays indexed, so an upgrade to
+    // parser 4 re-reads the session and keeps the previously stored messages.
+    fn v2_review_empty_copy_keeps_already_indexed_history() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "s", 200, 100, "stale indexed body");
+        let mut old =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        old.metadata_parser_version = Some(3);
+        let store =
+            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", old)
+                .unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "s", None, "removed");
+        conn.execute("DELETE FROM session_message", []).unwrap();
+        let mut changed = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert_eq!(changed.sessions.len(), 1);
+        assert_eq!(changed.sessions[0].messages.len(), 1);
+        assert_eq!(changed.sessions[0].messages[0].content, "stale indexed body");
+        let store = crate::sync::persist_raw_session_for_conformance(
+            store,
+            "opencode",
+            changed.sessions.pop().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let repeat = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert_eq!(repeat.stats.skipped_sessions, 1);
+        assert!(repeat.sessions.is_empty());
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_review_compaction_usage_survives_transcript_projection() {
+        let conn = Connection::open_in_memory().unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "s", None, "body");
+        let data = serde_json::json!({"status":"completed","reason":"auto","summary":"machine summary",
+            "model":{"id":"compressor","providerID":"provider"},
+            "tokens":{"input":12,"output":3,"reasoning":1,"cache":{"read":2,"write":0}}});
+        conn.execute(
+            "INSERT INTO session_message VALUES ('compaction','s','compaction',2,?1,150,150)",
+            [data.to_string()],
+        )
+        .unwrap();
+        let raw =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        assert_eq!(raw.messages.len(), 1);
+        assert_eq!(raw.usage_events.len(), 1);
+        assert_eq!(raw.usage_events[0].model, "compressor");
+        assert_eq!(raw.usage_events[0].input_tokens, 12);
+    }
+
+    #[test]
+    fn v2_review_tool_paths_follow_location_switch_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        add_v2_tables(&conn);
+        insert_v2_user(&conn, "s", None, "body");
+        conn.execute("UPDATE session_v2 SET directory='/new'", []).unwrap();
+        let tool = serde_json::json!({"content":[{"type":"tool","id":"read1","name":"read",
+            "state":{"status":"completed","input":{"filePath":"src/main.rs"},"content":[{"type":"text","text":"body"}]}}]});
+        conn.execute(
+            "INSERT INTO session_message VALUES ('before','s','assistant',2,?1,150,150)",
+            [tool.to_string()],
+        )
+        .unwrap();
+        let moved = serde_json::json!({"location":{"directory":"/new"},"previous":{"location":{"directory":"/old"}}});
+        conn.execute(
+            "INSERT INTO session_message VALUES ('move','s','location-switched',3,?1,160,160)",
+            [moved.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('after','s','assistant',4,?1,170,170)",
+            [tool.to_string()],
+        )
+        .unwrap();
+        let raw =
+            scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap().pop().unwrap();
+        assert_eq!(raw.events[0].files[0].cwd.as_deref(), Some("/old"));
+        assert_eq!(raw.events[2].files[0].cwd.as_deref(), Some("/new"));
+    }
+
     fn mark_event_current(store: &Store, source_id: &str, updated_at: Option<i64>) {
         seed_empty_event_state(store, "opencode", source_id, EVENT_PARSER_VERSION, updated_at);
     }
 
     fn mark_metadata_current(store: &Store, source_id: &str) {
         seed_empty_metadata_state(store, "opencode", source_id, METADATA_PARSER_VERSION);
+    }
+
+    #[test]
+    fn native_topology_preserves_parent_identity_and_unknown_roots() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute("ALTER TABLE session ADD COLUMN parent_id TEXT", []).unwrap();
+        for (id, parent) in [
+            ("root", None),
+            ("empty", Some("")),
+            ("blank", Some("  \t")),
+            ("self", Some("self")),
+            ("child", Some("root")),
+            ("orphan", Some("not-indexed")),
+        ] {
+            insert_session_with_message(&conn, id, 200, 100, id);
+            conn.execute(
+                "UPDATE session SET parent_id=?1 WHERE id=?2",
+                rusqlite::params![parent, id],
+            )
+            .unwrap();
+        }
+        let full = scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap();
+        let incremental = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::empty_for_test("opencode"),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap()
+        .sessions;
+        for sessions in [full, incremental] {
+            assert_eq!(sessions.len(), 6);
+            for raw in sessions {
+                assert_eq!(raw.messages[0].content, raw.source_id);
+                assert_eq!(raw.metadata_parser_version, Some(3));
+                let parent = match raw.source_id.as_str() {
+                    "child" => Some("root"),
+                    "orphan" => Some("not-indexed"),
+                    _ => None,
+                };
+                assert_eq!(raw.thread_role, parent.map(|_| ThreadRole::Subagent));
+                assert_eq!(
+                    raw.parent_links,
+                    parent
+                        .into_iter()
+                        .map(|id| ParentLink {
+                            relation: ParentRelation::Spawn,
+                            source: "opencode".to_string(),
+                            source_id: id.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_topology_accepts_schema_without_parent_column() {
+        let (path, conn) = setup_opencode_db();
+        insert_session_with_message(&conn, "legacy", 200, 100, "body survives");
+        let full = scan_with_options(&conn, true, ScanOptions::OPENCODE_NATIVE).unwrap();
+        let incremental = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::empty_for_test("opencode"),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap()
+        .sessions;
+        for sessions in [full, incremental] {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].messages[0].content, "body survives");
+            assert_eq!(sessions[0].thread_role, None);
+            assert!(sessions[0].parent_links.is_empty());
+            assert_eq!(sessions[0].metadata_parser_version, Some(3));
+        }
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_metadata_backfill_refreshes_once_without_source_changes() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute("ALTER TABLE session ADD COLUMN parent_id TEXT", []).unwrap();
+        insert_session_with_message(&conn, "child", 200, 100, "unchanged body");
+        conn.execute("UPDATE session SET parent_id='not-indexed' WHERE id='child'", []).unwrap();
+        let old = scan(&conn, true).unwrap().pop().unwrap();
+        assert_eq!(old.metadata_parser_version, Some(2));
+        let store =
+            crate::sync::persist_raw_session_for_conformance(setup_store(), "opencode", old)
+                .unwrap();
+        let mut result = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert_eq!(result.stats.skipped_sessions, 0);
+        assert_eq!(result.sessions.len(), 1);
+        let fresh = result.sessions.pop().unwrap();
+        assert!(fresh.refresh_session_on_metadata_backfill);
+        assert_eq!(fresh.metadata_parser_version, Some(3));
+        assert_eq!(fresh.parent_links[0].source_id, "not-indexed");
+        let store =
+            crate::sync::persist_raw_session_for_conformance(store, "opencode", fresh).unwrap();
+        let repeat = scan_for_sync_conn_with_options(
+            &conn,
+            &AdapterSyncContext::from_store_for_test(&store, "opencode").unwrap(),
+            None,
+            true,
+            ScanOptions::OPENCODE_NATIVE,
+        )
+        .unwrap();
+        assert_eq!(repeat.stats.skipped_sessions, 1);
+        assert!(repeat.sessions.is_empty());
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn shared_scanners_keep_metadata_two_and_ignore_parent_column() {
+        let (path, conn) = setup_opencode_db();
+        conn.execute("ALTER TABLE session ADD COLUMN parent_id TEXT", []).unwrap();
+        insert_session_with_message(&conn, "same-native-id", 200, 100, "same body");
+        conn.execute("UPDATE session SET parent_id='other-id'", []).unwrap();
+        for (source, options) in [
+            ("kilo-code", ScanOptions::default()),
+            ("mimo-code", ScanOptions::default()),
+            ("zcode", ScanOptions::ZCODE),
+        ] {
+            let mut full = scan_with_options(&conn, true, options).unwrap();
+            let first = scan_for_sync_conn_with_options(
+                &conn,
+                &AdapterSyncContext::empty_for_test(source),
+                None,
+                true,
+                options,
+            )
+            .unwrap();
+            assert_eq!(first.sessions.len(), 1);
+            for raw in full.iter().chain(first.sessions.iter()) {
+                assert_eq!(raw.source_id, "same-native-id");
+                assert_eq!(raw.messages[0].content, "same body");
+                assert_eq!(raw.metadata_parser_version, Some(2));
+                assert_eq!(raw.thread_role, None);
+                assert!(raw.parent_links.is_empty());
+            }
+            let store = crate::sync::persist_raw_session_for_conformance(
+                setup_store(),
+                source,
+                full.pop().unwrap(),
+            )
+            .unwrap();
+            let repeat = scan_for_sync_conn_with_options(
+                &conn,
+                &AdapterSyncContext::from_store_for_test(&store, source).unwrap(),
+                None,
+                true,
+                options,
+            )
+            .unwrap();
+            assert_eq!(repeat.stats.skipped_sessions, 1);
+            assert!(repeat.sessions.is_empty());
+        }
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1112,7 +1927,8 @@ mod tests {
         insert_session_with_message(&conn, "old", 1_600_000_000, 1_600_000_000, "hello");
 
         let cutoff = 1_700_000_000_000;
-        let (kept, filtered) = load_session_rows(&conn, Some(cutoff), None).unwrap();
+        let (kept, filtered) =
+            load_session_rows(&conn, Some(cutoff), None, ScanOptions::default()).unwrap();
         assert_eq!(kept.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), vec!["recent"]);
         assert_eq!(filtered, 1);
 
@@ -1456,7 +2272,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sessions, _) = load_session_rows(&conn, None, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None, None, ScanOptions::default()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "good");
         drop(conn);
@@ -1503,7 +2319,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sessions, _) = load_session_rows(&conn, None, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None, None, ScanOptions::default()).unwrap();
         let raw = scan_session_messages(&conn, sessions, false, ScanOptions::default()).unwrap();
         let titled = raw.iter().find(|session| session.source_id == "s1").unwrap();
         let blank = raw.iter().find(|session| session.source_id == "s2").unwrap();
@@ -1549,7 +2365,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sessions, _) = load_session_rows(&conn, None, None).unwrap();
+        let (sessions, _) = load_session_rows(&conn, None, None, ScanOptions::default()).unwrap();
         let raw = scan_session_messages(&conn, sessions, true, ScanOptions::default()).unwrap();
 
         assert_eq!(raw.len(), 1);
