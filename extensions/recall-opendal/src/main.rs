@@ -16,7 +16,7 @@ fn main() -> ExitCode {
             println!(
                 "{}",
                 json!({"name":"opendal", "version":env!("CARGO_PKG_VERSION"),
-                "protocol":2,"min_recall":"0.6.0",
+                "protocol":2,"min_recall":"0.6.5","transport_version":1,
                 "description":"Remote storage through Apache OpenDAL"})
             );
             ExitCode::SUCCESS
@@ -39,8 +39,8 @@ fn main() -> ExitCode {
                 Ok(result) => json!({"transport_version":1,"result":result}),
                 Err(error) => json!({"transport_version":1,"error":error}),
             };
-            if let Err(error) = emit(response) {
-                eprintln!("cannot write transport response: {error}");
+            if emit(response).is_err() {
+                eprintln!("cannot write transport response");
                 return ExitCode::FAILURE;
             }
             if success { ExitCode::SUCCESS } else { ExitCode::FAILURE }
@@ -94,7 +94,7 @@ fn transport() -> Result<Value> {
         }
     })??;
     if serde_json::to_vec(&json!({"transport_version":1,"result":result}))
-        .map_err(|e| Failure::new("unavailable", e.to_string()))?
+        .map_err(|_| Failure::new("unavailable", "cannot serialize transport response"))?
         .len()
         > protocol::CONTROL_LIMIT
     {

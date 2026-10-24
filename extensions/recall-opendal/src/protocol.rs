@@ -24,12 +24,12 @@ pub enum Operation {
 
 pub fn parse(bytes: &[u8]) -> Result<Request> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|error| Failure::new("invalid_request", error.to_string()))?;
+        .map_err(|_| Failure::new("invalid_request", "invalid transport request JSON or fields"))?;
     if value.get("transport_version").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(Failure::new("unsupported_protocol", "transport_version must be 1"));
     }
     let request: Request = serde_json::from_value(value)
-        .map_err(|error| Failure::new("invalid_request", error.to_string()))?;
+        .map_err(|_| Failure::new("invalid_request", "invalid transport request JSON or fields"))?;
     debug_assert_eq!(request.transport_version, 1);
     if request.timeout_ms == 0
         || Instant::now().checked_add(Duration::from_millis(request.timeout_ms)).is_none()

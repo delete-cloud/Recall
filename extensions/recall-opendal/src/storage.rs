@@ -20,37 +20,32 @@ pub fn with_operator<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 pub fn verify(operator: &Operator) -> Result<()> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| Failure::new("unavailable", error.to_string()))?
-        .as_nanos();
-    let key = format!("recall-opendal-probe/{}-{stamp}", std::process::id());
-    let content = b"recall-opendal configuration probe";
-    operator.write(&key, content.to_vec()).map_err(Failure::backend)?;
-    let read = operator.read(&key).map_err(Failure::backend);
-    let delete = operator.delete(&key).map_err(Failure::backend);
-    let bytes = read?;
-    delete?;
-    if bytes.to_vec() != content {
-        return Err(Failure::new("integrity", "configuration probe readback mismatch"));
+    check_fs_root(operator)?;
+    let options = opendal::options::ListOptions { limit: Some(1), ..Default::default() };
+    // The pinned blocking check() swallows NotFound and has no limit. Consume
+    // the actual bounded list response so missing/ambiguous targets fail.
+    let mut entries = operator.lister_options("", options).map_err(Failure::backend)?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(Failure::backend)?;
+    }
+    Ok(())
+}
+
+fn check_fs_root(operator: &Operator) -> Result<()> {
+    if operator.info().scheme() == "fs" {
+        let metadata = std::fs::metadata(operator.info().root()).map_err(Failure::io)?;
+        if !metadata.is_dir() {
+            return Err(Failure::new("target_missing", "filesystem root is not a directory"));
+        }
     }
     Ok(())
 }
 
 pub fn execute(operator: &Operator, operation: Operation) -> Result<Value> {
+    check_fs_root(operator)?;
     match operation {
         Operation::Probe => {
-            // stat("/") returns a synthetic DIR on several backends without I/O,
-            // so probe must do a real listing instead. OpenDAL's check() does a
-            // 1-entry list; NotFound on the root itself is mapped to
-            // target_missing below.
-            operator.check().map_err(|error| {
-                let mut failure = Failure::backend(error);
-                if failure.code == "object_missing" {
-                    failure.code = "target_missing";
-                }
-                failure
-            })?;
+            verify(operator)?;
             Ok(json!({"readable":true}))
         }
         Operation::List { prefix, cursor, page_size } => {
@@ -115,42 +110,136 @@ pub fn execute(operator: &Operator, operation: Operation) -> Result<Value> {
                 return Err(Failure::new("integrity", "upload size or SHA-256 mismatch"));
             }
             snapshot.rewind().map_err(Failure::io)?;
-            if operator.info().capability().write_can_multi {
-                let mut writer = operator.writer(&key).map_err(Failure::backend)?;
-                loop {
-                    let n = snapshot.read(&mut buffer).map_err(Failure::io)?;
-                    if n == 0 {
-                        break;
+            if operator.info().scheme() == "fs" {
+                match publish_fs(operator, &key, &mut snapshot) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        verify_existing(operator, &key, actual_size, &actual_hash)?;
                     }
-                    writer.write(buffer[..n].to_vec()).map_err(Failure::backend)?;
+                    Err(error) => return Err(Failure::io(error)),
                 }
-                writer.close().map_err(Failure::backend)?;
             } else {
-                let mut body = Vec::with_capacity(actual_size as usize);
-                snapshot.read_to_end(&mut body).map_err(Failure::io)?;
-                // Verified-identical conflict: write only when the key is absent.
-                // An existing object under an immutable content-addressed key
-                // already holds the same verified bytes.
-                if operator.info().capability().write_with_if_not_exists {
-                    let options = opendal::options::WriteOptions {
-                        if_not_exists: true,
-                        ..Default::default()
-                    };
-                    match operator.write_options(&key, body, options) {
-                        Ok(_) => {}
-                        Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {
-                            // Another writer raced us to the same immutable key;
-                            // identical bytes are already published.
-                        }
-                        Err(error) => return Err(Failure::backend(error)),
+                match publish_remote(operator, &key, &mut snapshot, actual_size, &mut buffer) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            opendal::ErrorKind::ConditionNotMatch
+                                | opendal::ErrorKind::AlreadyExists
+                                | opendal::ErrorKind::Conflict
+                        ) =>
+                    {
+                        verify_existing(operator, &key, actual_size, &actual_hash)?;
                     }
-                } else {
-                    operator.write(&key, body).map_err(Failure::backend)?;
+                    Err(error) => return Err(Failure::backend(error)),
                 }
             }
             Ok(json!({"size":actual_size,"sha256":actual_hash}))
         }
     }
+}
+
+fn publish_fs(operator: &Operator, key: &str, snapshot: &mut std::fs::File) -> std::io::Result<()> {
+    let root = std::path::PathBuf::from(operator.info().root());
+    let staging = root.join(".recall-opendal-tmp");
+    create_directory(&staging)?;
+    let mut parent = root;
+    let segments: Vec<_> = key.split('/').collect();
+    for segment in &segments[..segments.len() - 1] {
+        parent.push(segment);
+        // Create one level at a time: a removed root must not be recreated.
+        create_directory(&parent)?;
+    }
+    let mut file = tempfile::NamedTempFile::new_in(&staging)?;
+    std::io::copy(snapshot, file.as_file_mut())?;
+    file.as_file_mut().sync_all()?;
+    file.persist_noclobber(parent.join(segments[segments.len() - 1]))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn create_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn publish_remote(
+    operator: &Operator,
+    key: &str,
+    snapshot: &mut std::fs::File,
+    size: u64,
+    buffer: &mut [u8],
+) -> opendal::Result<()> {
+    let capability = operator.info().capability();
+    if !capability.write_with_if_not_exists {
+        return Err(opendal::Error::new(
+            opendal::ErrorKind::Unsupported,
+            "backend does not support conditional publication",
+        ));
+    }
+    let options = opendal::options::WriteOptions { if_not_exists: true, ..Default::default() };
+    if capability.write_can_multi {
+        let mut writer = operator.writer_options(key, options)?;
+        let result = (|| {
+            loop {
+                let n = snapshot.read(buffer).map_err(local_upload_error)?;
+                if n == 0 {
+                    break;
+                }
+                writer.write(buffer[..n].to_vec())?;
+            }
+            writer.close()?;
+            Ok(())
+        })();
+        // Dropping the blocking writer never retries an unconditional publication.
+        result
+    } else {
+        let capacity = usize::try_from(size).map_err(|_| {
+            opendal::Error::new(opendal::ErrorKind::Unsupported, "upload cannot fit in memory")
+        })?;
+        let mut body = Vec::with_capacity(capacity);
+        snapshot.read_to_end(&mut body).map_err(local_upload_error)?;
+        operator.write_options(key, body, options)?;
+        Ok(())
+    }
+}
+
+fn local_upload_error(_: std::io::Error) -> opendal::Error {
+    opendal::Error::new(opendal::ErrorKind::Unexpected, "cannot read upload snapshot")
+}
+
+fn verify_existing(operator: &Operator, key: &str, size: u64, sha256: &str) -> Result<()> {
+    let conflict = || Failure::new("conflict", "immutable key contains different bytes");
+    let metadata = operator.stat(key).map_err(Failure::backend)?;
+    if !metadata.is_file() || metadata.content_length() != size {
+        return Err(conflict());
+    }
+    let mut reader = operator
+        .reader(key)
+        .map_err(Failure::backend)?
+        .into_std_read(..)
+        .map_err(Failure::backend)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; CHUNK];
+    let mut actual = 0u64;
+    loop {
+        let n = reader.read(&mut buffer).map_err(Failure::io)?;
+        if n == 0 {
+            break;
+        }
+        actual = actual.checked_add(n as u64).ok_or_else(conflict)?;
+        if actual > size {
+            return Err(conflict());
+        }
+        digest.update(&buffer[..n]);
+    }
+    if actual != size || format!("{:x}", digest.finalize()) != sha256 {
+        return Err(conflict());
+    }
+    Ok(())
 }
 
 fn list(
@@ -176,6 +265,7 @@ fn list(
     // OpenDAL's limit is a backend page-size hint, not a total-result limit.
     // Backends need not return sorted entries. Retain the smallest page+1 keys
     // across the iterator, using bounded memory and stable lexical cursors.
+    let ordered = operator.info().scheme() == "s3" && capability.list_with_start_after;
     let mut keys = BTreeMap::new();
     for entry in operator.lister_options(prefix, options).map_err(Failure::backend)? {
         let entry = entry.map_err(Failure::backend)?;
@@ -188,6 +278,9 @@ fn list(
             .map_err(|_| Failure::new("integrity", "backend returned an invalid remote key"))?;
         let size = if metadata.is_file() { Some(metadata.content_length()) } else { None };
         keys.insert(key.to_owned(), size);
+        if ordered && keys.len() == page_size + 1 {
+            break;
+        }
         if keys.len() > page_size + 1 {
             keys.pop_last();
         }

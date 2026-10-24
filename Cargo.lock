@@ -4081,11 +4081,13 @@ dependencies = [
  "anyhow",
  "dirs",
  "opendal",
+ "reqsign-core",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]

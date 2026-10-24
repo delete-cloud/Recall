@@ -98,7 +98,8 @@ fn manifest_has_standalone_identity() {
     assert_eq!(manifest["name"], "opendal");
     assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest["protocol"], 2);
-    assert_eq!(manifest["min_recall"], "0.6.0");
+    assert_eq!(manifest["min_recall"], "0.6.5");
+    assert_eq!(manifest["transport_version"], 1);
 }
 
 #[test]
@@ -378,4 +379,91 @@ fn deadline_covers_a_stalled_http_backend() {
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
     // The plugin's mpsc wait has returned; the worker thread may still be
     // blocked on the socket. Detach so the test process can exit.
+}
+
+#[test]
+fn immutable_put_preserves_existing_bytes_and_verifies_retries() {
+    let p = Provider::new();
+    let first = b"immutable original";
+    let other = b"different original";
+    assert!(p.upload("v1/immutable", first).get("result").is_some());
+    assert!(p.upload("v1/immutable", first).get("result").is_some());
+    let different = p.upload("v1/immutable", other);
+    assert_eq!(different["error"]["code"], "conflict", "{different}");
+    assert_eq!(std::fs::read(p.root.join("v1/immutable")).unwrap(), first);
+    std::fs::write(p.root.join("v1/immutable"), b"externally corrupted").unwrap();
+    let retry = p.upload("v1/immutable", first);
+    assert_eq!(retry["error"]["code"], "conflict", "{retry}");
+    assert_eq!(std::fs::read(p.root.join("v1/immutable")).unwrap(), b"externally corrupted");
+}
+
+#[test]
+fn simultaneous_fs_writers_publish_one_complete_object() {
+    let p = Provider::new();
+    let count = 8;
+    let barrier = std::sync::Barrier::new(count);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..count)
+            .map(|i| {
+                let barrier = &barrier;
+                let p = &p;
+                scope.spawn(move || {
+                    let content = vec![b'a' + i as u8; 4 * 1024 * 1024 + i];
+                    let source = p.temp.path().join(format!("writer-{i}"));
+                    std::fs::write(&source, &content).unwrap();
+                    barrier.wait();
+                    let response = p.request(json!({"operation":"put","key":"v1/race",
+                    "input_path":source,"size":content.len(),
+                    "sha256":format!("{:x}",Sha256::digest(&content))}));
+                    (content, response)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+    });
+    let winners: Vec<_> =
+        results.iter().filter(|(_, response)| response.get("result").is_some()).collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "responses: {:?}",
+        results.iter().map(|(_, v)| v).collect::<Vec<_>>()
+    );
+    for (_, response) in &results {
+        if response.get("result").is_none() {
+            assert_eq!(response["error"]["code"], "conflict");
+        }
+    }
+    assert_eq!(std::fs::read(p.root.join("v1/race")).unwrap(), winners[0].0);
+}
+
+#[test]
+fn missing_fs_root_fails_without_recreating_an_empty_target() {
+    let p = Provider::new();
+    std::fs::remove_dir_all(&p.root).unwrap();
+    for request in
+        [json!({"operation":"probe"}), json!({"operation":"list","prefix":"v1/","page_size":1})]
+    {
+        let response = p.request(request);
+        assert_eq!(response["error"]["code"], "target_missing", "{response}");
+        assert!(!p.root.exists());
+    }
+    let source = p.temp.path().join("upload-source");
+    std::fs::write(&source, b"x").unwrap();
+    let response = p.upload("v1/absent", b"x");
+    assert_eq!(response["error"]["code"], "target_missing", "{response}");
+    assert!(!p.root.exists());
+}
+
+#[test]
+fn malformed_transport_does_not_echo_payload_values() {
+    let p = Provider::new();
+    let canary = "private-session-body-canary";
+    for request in
+        [json!({"operation":canary}), json!({"operation":"list","prefix":17,"page_size":canary})]
+    {
+        let response = p.request(request);
+        assert_eq!(response["error"]["code"], "invalid_request");
+        assert!(!response.to_string().contains(canary), "{response}");
+    }
 }
